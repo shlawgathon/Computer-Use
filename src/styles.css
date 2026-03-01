@@ -726,14 +726,36 @@ code {
   padding-top: 4px;
 }
 
+/* ── Hover-only mode: pill visually collapses to a dot, expands on hover ── */
+
 .hud-root.hud-hover-only .hud-pill {
-  opacity: 0.06;
-  transition: opacity 250ms ease;
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  border-radius: 50%;
+  overflow: hidden;
+  padding: 0;
+  transition: width 250ms ease, height 250ms ease, border-radius 250ms ease, padding 250ms ease;
+  justify-content: center;
+  align-items: center;
 }
 
-.hud-root.hud-hover-only .hud-pill:hover,
-.hud-root.hud-hover-only .hud-pill.expanded {
+.hud-root.hud-hover-only .hud-pill > * {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+
+.hud-root.hud-hover-only .hud-pill:hover {
+  width: 100%;
+  height: 100%;
+  border-radius: 18px;
+  padding: 6px 10px;
+}
+
+.hud-root.hud-hover-only .hud-pill:hover > * {
   opacity: 1;
+  pointer-events: auto;
 }
 
 

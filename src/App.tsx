@@ -998,27 +998,41 @@ function HudWindow() {
     }
   };
 
-  const toggleCollapse = async () => {
+  const collapseHud = async () => {
     const win = getCurrentWindow();
     const monitor = await currentMonitor();
     const scale = monitor?.scaleFactor || 1;
     const monX = monitor ? monitor.position.x / scale : 0;
     const monW = monitor ? monitor.size.width / scale : 1400;
     const monY = monitor ? monitor.position.y / scale : 0;
-    const next = !hudCollapsed;
-    setHudCollapsed(next);
-    if (next) {
-      setHudPanel("none");
-      const w = 48, h = 48;
-      await win.setMinSize(new LogicalSize(w, h)).catch(() => undefined);
-      await win.setMaxSize(new LogicalSize(w, h)).catch(() => undefined);
-      await win.setSize(new LogicalSize(w, h)).catch(() => undefined);
-      await win.setPosition(new LogicalPosition(monX + monW / 2 - w / 2, monY + 20)).catch(() => undefined);
+    setHudCollapsed(true);
+    setHudPanel("none");
+    const w = 48, h = 48;
+    await win.setMinSize(new LogicalSize(w, h)).catch(() => undefined);
+    await win.setMaxSize(new LogicalSize(w, h)).catch(() => undefined);
+    await win.setSize(new LogicalSize(w, h)).catch(() => undefined);
+    await win.setPosition(new LogicalPosition(monX + monW / 2 - w / 2, monY + 20)).catch(() => undefined);
+  };
+
+  const expandHud = async () => {
+    const win = getCurrentWindow();
+    const monitor = await currentMonitor();
+    const scale = monitor?.scaleFactor || 1;
+    const monX = monitor ? monitor.position.x / scale : 0;
+    const monW = monitor ? monitor.size.width / scale : 1400;
+    const monY = monitor ? monitor.position.y / scale : 0;
+    setHudCollapsed(false);
+    await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+    await win.setMaxSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+    await win.setSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+    await win.setPosition(new LogicalPosition(monX + monW / 2 - HUD_WIDTH / 2, monY + 20)).catch(() => undefined);
+  };
+
+  const toggleCollapse = async () => {
+    if (hudCollapsed) {
+      await expandHud();
     } else {
-      await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-      await win.setMaxSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-      await win.setSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-      await win.setPosition(new LogicalPosition(monX + monW / 2 - HUD_WIDTH / 2, monY + 20)).catch(() => undefined);
+      await collapseHud();
     }
   };
 
@@ -1300,6 +1314,7 @@ function MainApp() {
   );
   const [overlayEnabled, setOverlayEnabled] = useState(true);
   const [hudEnabled, setHudEnabled] = useState(true);
+  const [hoverMode, setHoverMode] = useState(false);
 
   const [permissions, setPermissions] = useState<PermissionState | null>(null);
   const [envStatus, setEnvStatus] = useState<EnvStatus | null>(null);
@@ -2146,14 +2161,22 @@ function MainApp() {
           <button onClick={() => {
             const newVal = !hudEnabled;
             void setHud(newVal);
-            if (!newVal) void emit("hud_hover_mode", true);
+            if (!newVal) {
+              setHoverMode(false);
+              void emit("hud_hover_mode", false);
+            }
           }}>
             {hudEnabled ? "Hide Top HUD" : "Show Top HUD"}
           </button>
-          <button onClick={() => {
-            void emit("hud_hover_mode", !hudEnabled);
-          }}>
-            Hover Mode
+          <button
+            onClick={() => {
+              const next = !hoverMode;
+              setHoverMode(next);
+              void emit("hud_hover_mode", next);
+            }}
+            style={hoverMode ? { borderColor: 'rgba(61,207,145,0.72)', background: 'var(--accent-soft)' } : undefined}
+          >
+            {hoverMode ? "Hover Mode ✓" : "Hover Mode"}
           </button>
           <button onClick={() => setDarkMode((v) => !v)}>
             {darkMode ? "Light Mode" : "Dark Mode"}
