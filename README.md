@@ -22,7 +22,11 @@ Every click goes through a multi-stage precision pipeline:
 1. **Normalized coordinates** — the vision model returns `x_norm` / `y_norm` in a `[0, 1000]` space relative to the screenshot, eliminating resolution dependency.
 2. **Scale-factor-aware conversion** — coordinates are translated from screenshot pixels → macOS logical points, accounting for Retina scaling (`2.0x`, `3.0x`) and multi-monitor offsets.
 3. **Confidence gating** — each action carries a `confidence` score (0–1). Clicks below the threshold (default `0.60`, configurable via `AGENT_CONFIDENCE_THRESHOLD`) are **automatically rejected** before the mouse moves.
-4. **Adaptive resolution** — screenshots are downscaled to `AGENT_INFER_MAX_DIM` (default `960px`) before sending to the model, balancing accuracy vs. inference speed.
+4. **Image compression pipeline** — screenshots are compressed before inference to optimize speed and cost:
+   - **Adaptive downscaling** — images are resized to fit within `AGENT_INFER_MAX_DIM` (default `960px`, range `640–4096`) while preserving aspect ratio.
+   - **Triangle filter** — uses bilinear interpolation for clean downscaling without aliasing artifacts.
+   - **PNG re-encoding** — compressed images are re-encoded as PNG to minimize payload size while staying lossless.
+   - Telemetry logs original vs. sent dimensions (e.g., `2560x1440 -> 960x540`) so you can tune the tradeoff.
 5. **Visual verification** — the transparent overlay shows a pulsing cursor at the exact click target before actuation, so you can visually confirm accuracy.
 
 ### Hotkey-First Navigation
