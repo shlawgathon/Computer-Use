@@ -15,6 +15,7 @@ Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on m
 - Step history is passed between iterations so the agent remembers what it already did.
 - Configurable confidence threshold — low-confidence actions are rejected automatically.
 - **Window context awareness** — detects the currently active application and window title, feeding it to the model so it understands the current context.
+- **App state awareness** — queries scriptable macOS apps (Spotify, Chrome, Safari, Finder, etc.) via AppleScript for their internal state (player state, current track, active URL, folder path, etc.). Unknown apps get a generic focused-element probe. This means the agent knows if Spotify is paused or playing without relying on tiny UI icons.
 
 ### Virtual Cursor (CGEvent)
 
