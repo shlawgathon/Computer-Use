@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ElapsedTimer, ActivityFeed, stampStep, type TimestampedStep, type AgentStep } from "./HudWidgets";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import {
@@ -77,6 +78,11 @@ type RecordingSummary = {
   fps: number;
   frame_ticks: number;
   duration_ms: number;
+  name?: string;
+  instruction?: string;
+  task_context?: string;
+  model?: string;
+  input_event_count?: number;
 };
 
 type SessionReplayResult = {
@@ -85,6 +91,27 @@ type SessionReplayResult = {
   frame_path: string;
   action: VisionAction;
   clicked: boolean;
+};
+
+type SessionManifest = {
+  session_id: string;
+  name: string;
+  instruction: string;
+  task_context: string;
+  model: string;
+  output_dir: string;
+  fps: number;
+  frame_ticks: number;
+  duration_ms: number;
+  input_event_count: number;
+};
+
+type SessionStatus = {
+  active: boolean;
+  session_id: string | null;
+  name: string | null;
+  elapsed_ms: number | null;
+  frame_ticks: number;
 };
 
 type AgentCursorEvent = {
@@ -116,12 +143,7 @@ type HudActionError = {
   message: string;
 };
 
-type AgentStep = {
-  phase: "capture" | "thinking" | "click" | "hotkey" | "type" | "done" | "error";
-  step: number;
-  max_steps: number;
-  message: string;
-};
+// AgentStep type is now imported from HudWidgets
 
 const OVERLAY_LABEL = "overlay";
 const OVERLAY_QUERY_KEY = "overlay";
@@ -648,14 +670,27 @@ function HudWindow() {
   const [hudHoverOnly, setHudHoverOnly] = useState(false);
   const [hudCollapsed, setHudCollapsed] = useState(false);
 
-  const [hudPanel, setHudPanel] = useState<"none" | "activity" | "command">("none");
-  const [activityFeed, setActivityFeed] = useState<AgentStep[]>([]);
+  const [hudPanel, setHudPanel] = useState<"none" | "activity" | "command" | "record">("none");
+  const [activityFeed, setActivityFeed] = useState<TimestampedStep[]>([]);
   const [hudInstruction, setHudInstruction] = useState("");
   const [hudContext, setHudContext] = useState("");
   const activityEndRef = useRef<HTMLDivElement>(null);
 
+  // ── Record panel state ──────────────────────────
+  const [recSessionName, setRecSessionName] = useState("");
+  const [recInstruction, setRecInstruction] = useState("");
+  const [recActive, setRecActive] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
+  const [savedSessions, setSavedSessions] = useState<SessionManifest[]>([]);
+  const [selectedSession, setSelectedSession] = useState<SessionManifest | null>(null);
+  const [repeatCount, setRepeatCount] = useState(1);
+  const [infiniteRepeat, setInfiniteRepeat] = useState(false);
+  const replayStopRef = useRef(false);
+  const [replaying, setReplaying] = useState(false);
+  const [saveRun, setSaveRun] = useState(false);
+
   const pushActivity = (step: AgentStep) => {
-    setActivityFeed((f) => [...f.slice(-30), step]);
+    setActivityFeed((f) => [...f.slice(-30), stampStep(step)]);
     setTimeout(() => activityEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
   };
 
@@ -679,7 +714,7 @@ function HudWindow() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
-  const togglePanel = async (panel: "activity" | "command") => {
+  const togglePanel = async (panel: "activity" | "command" | "record") => {
     const win = getCurrentWindow();
     if (hudPanel === panel) {
       setHudPanel("none");
@@ -689,11 +724,127 @@ function HudWindow() {
       await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
     } else {
       setHudPanel(panel);
-      const h = panel === "activity" ? 180 : 200;
-      await win.setFocusable(panel === "command").catch(() => undefined);
+      const h = panel === "activity" ? 180 : panel === "record" ? 280 : 200;
+      await win.setFocusable(panel === "command" || panel === "record").catch(() => undefined);
       await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
       await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
       await win.setSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
+    }
+  };
+
+  // ── Record panel helpers ────────────────────────
+  const refreshSessions = async () => {
+    try {
+      const list = await invoke<SessionManifest[]>("list_sessions_cmd");
+      setSavedSessions(list);
+    } catch { /* best-effort */ }
+  };
+
+  const refreshRecSession = async () => {
+    try {
+      const s = await invoke<SessionStatus>("session_status_cmd");
+      setRecActive(s.active);
+      setRecElapsed(s.elapsed_ms ?? 0);
+    } catch { /* best-effort */ }
+  };
+
+  useEffect(() => {
+    if (hudPanel === "record") {
+      void refreshSessions();
+      void refreshRecSession();
+    }
+  }, [hudPanel]);
+
+  useEffect(() => {
+    if (!recActive) return;
+    const id = window.setInterval(() => void refreshRecSession(), 500);
+    return () => window.clearInterval(id);
+  }, [recActive]);
+
+  const startSession = async () => {
+    try {
+      await invoke("start_session_cmd", {
+        req: {
+          name: recSessionName.trim() || undefined,
+          instruction: recInstruction.trim() || undefined,
+          task_context: hudContext.trim() || undefined,
+          model: DEFAULT_HUD_MODEL,
+          fps: 2,
+        },
+      });
+      setRecActive(true);
+    } catch (err) {
+      await emit("hud_action_error", { action: "session_start", message: String(err) }).catch(() => undefined);
+    }
+  };
+
+  const stopSession = async () => {
+    try {
+      await invoke<SessionManifest>("stop_session_cmd");
+      setRecActive(false);
+      setRecSessionName("");
+      setRecInstruction("");
+      void refreshSessions();
+    } catch (err) {
+      await emit("hud_action_error", { action: "session_stop", message: String(err) }).catch(() => undefined);
+    }
+  };
+
+  const replaySession = async () => {
+    if (!selectedSession) return;
+    replayStopRef.current = false;
+    setReplaying(true);
+    const loops = infiniteRepeat ? Infinity : Math.max(1, repeatCount);
+    const inst = selectedSession.instruction || hudInstruction || "Repeat the recorded task";
+    try {
+      for (let rep = 0; rep < loops; rep++) {
+        if (replayStopRef.current) break;
+        loopStopRef.current = false;
+        setLooping(true);
+        setBusy((b) => ({ ...b, run: true }));
+        const MAX_STEPS = 30;
+        const stepHistory: string[] = [];
+        for (let step = 1; step <= MAX_STEPS; step++) {
+          if (loopStopRef.current || replayStopRef.current) break;
+          const captured = await invoke<CaptureFrame>("capture_primary_cmd");
+          const inferred = await invoke<VisionAction>("infer_click_cmd", {
+            req: {
+              png_path: captured.png_path,
+              instruction: inst,
+              model: DEFAULT_HUD_MODEL,
+              step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
+            },
+          });
+          if (inferred.action === "none" || loopStopRef.current || replayStopRef.current) {
+            await emit("agent_step", { phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason } as AgentStep).catch(() => undefined);
+            break;
+          }
+          if (inferred.action === "click") {
+            await invoke("execute_real_click_cmd", {
+              req: { x_norm: inferred.x_norm, y_norm: inferred.y_norm, screenshot_w_px: captured.screenshot_w_px, screenshot_h_px: captured.screenshot_h_px, monitor_origin_x_pt: captured.monitor_origin_x_pt, monitor_origin_y_pt: captured.monitor_origin_y_pt, scale_factor: captured.scale_factor, confidence: inferred.confidence },
+            });
+            stepHistory.push(`Step ${step}: click (${inferred.x_norm},${inferred.y_norm}) — ${inferred.reason}`);
+          } else if (inferred.action === "hotkey" && inferred.keys?.length) {
+            await invoke("press_keys_cmd", { req: { keys: inferred.keys, delay_ms: 30 } });
+            stepHistory.push(`Step ${step}: hotkey ${inferred.keys.map(k => k.key).join("+")} — ${inferred.reason}`);
+          } else if (inferred.action === "type" && inferred.text) {
+            await invoke("type_text_cmd", { text: inferred.text });
+            stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
+          }
+          const s: AgentStep = { phase: inferred.action as AgentStep["phase"], step, max_steps: MAX_STEPS, message: inferred.reason };
+          await emit("agent_step", s).catch(() => undefined);
+          await new Promise(r => setTimeout(r, 800));
+        }
+        setLooping(false);
+        setBusy((b) => ({ ...b, run: false }));
+        if (rep + 1 < loops && !replayStopRef.current) {
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+    } finally {
+      setReplaying(false);
+      setLooping(false);
+      setBusy((b) => ({ ...b, run: false }));
     }
   };
 
@@ -704,6 +855,23 @@ function HudWindow() {
     const MAX_STEPS = 30;
     const inst = hudInstruction || status.instruction || "Click the target button";
     const stepHistory: string[] = [];
+
+    // Auto-save run as session if toggled on
+    if (saveRun) {
+      try {
+        await invoke("start_session_cmd", {
+          req: {
+            name: `Run: ${inst.slice(0, 40)}`,
+            instruction: inst,
+            task_context: hudContext.trim() || undefined,
+            model: DEFAULT_HUD_MODEL,
+            fps: 2,
+          },
+        });
+        setRecActive(true);
+      } catch { /* best-effort */ }
+    }
+
     try {
       for (let step = 1; step <= MAX_STEPS; step++) {
         if (loopStopRef.current) break;
@@ -762,6 +930,14 @@ function HudWindow() {
       const errStep: AgentStep = { phase: "error", step: 0, max_steps: MAX_STEPS, message: String(err) };
       await emit("agent_step", errStep).catch(() => undefined);
     } finally {
+      // Stop session recording if it was started
+      if (saveRun) {
+        try {
+          await invoke("stop_session_cmd");
+          setRecActive(false);
+          void refreshSessions();
+        } catch { /* best-effort */ }
+      }
       setLooping(false);
       setBusy((b) => ({ ...b, run: false }));
     }
@@ -798,7 +974,7 @@ function HudWindow() {
     >
       <section
         className={`hud-pill ${hudPanel !== "none" ? "expanded" : ""} ${hudCollapsed ? "collapsed" : ""}`}
-        onMouseDown={(e) => { if (!hudPanel || hudPanel !== "command") e.preventDefault(); }}
+        onMouseDown={(e) => { if (hudPanel !== "command" && hudPanel !== "record") e.preventDefault(); }}
         title={hudCollapsed ? "Click to expand" : "Agenticify HUD"}
       >
         {hudCollapsed ? (
@@ -827,6 +1003,18 @@ function HudWindow() {
                 <path d="M5 7h14" />
                 <path d="M5 12h14" />
                 <path d="M5 17h14" />
+              </svg>
+            </button>
+            <button
+              className={`hud-btn hud-btn-icon ${hudPanel === "record" ? "active" : ""} ${recActive ? "recording-pulse" : ""}`}
+              onClick={(e) => { e.stopPropagation(); void togglePanel("record"); }}
+              title="Session recording & replay"
+              aria-label="Session recording & replay"
+              type="button"
+            >
+              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
+                <circle cx="12" cy="12" r="8" />
+                <circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none" />
               </svg>
             </button>
             <button
@@ -881,6 +1069,8 @@ function HudWindow() {
                 STOP
               </button>
             )}
+            <ElapsedTimer active={looping} label="▶" />
+            <ElapsedTimer active={recActive} label="●" />
             <span
               className={`hud-state ${recordingActive ? "ok" : "bad"}`}
               title={recordingActive ? `Recording (${recordingTicks} ticks)` : "Recording idle"}
@@ -909,17 +1099,7 @@ function HudWindow() {
 
         {hudPanel === "activity" && (
           <div className="hud-dropdown">
-            {activityFeed.length === 0 ? (
-              <div className="hud-activity-item" style={{ opacity: 0.5 }}>No activity yet</div>
-            ) : (
-              activityFeed.map((a, i) => (
-                <div key={i} className="hud-activity-item">
-                  <span className={`phase-tag ${a.phase}`}>{a.phase}</span>
-                  <span>{a.step > 0 ? `[${a.step}/${a.max_steps}] ` : ""}{a.message}</span>
-                </div>
-              ))
-            )}
-            <div ref={activityEndRef} />
+            <ActivityFeed items={activityFeed} endRef={activityEndRef} />
           </div>
         )}
 
@@ -950,9 +1130,107 @@ function HudWindow() {
               >
                 {looping ? "Running..." : "▶ Run Loop"}
               </button>
+              <label style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "0.5rem", color: "rgba(226,232,240,0.7)", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={saveRun}
+                  onChange={(e) => setSaveRun(e.target.checked)}
+                  style={{ width: "12px", height: "12px", accentColor: "var(--accent)" }}
+                />
+                Save run
+              </label>
             </div>
           </div>
         )}
+
+        {hudPanel === "record" && (
+          <div className="hud-input-panel">
+            {recActive ? (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  <span className="hud-state recording-pulse" style={{ background: "rgba(255,60,60,0.25)", borderColor: "rgba(255,60,60,0.7)", color: "#ff8080" }}>● REC</span>
+                  <span style={{ fontSize: "0.55rem", color: "rgba(226,232,240,0.7)" }}>{formatDuration(recElapsed)}</span>
+                </div>
+                <div className="hud-input-actions">
+                  <button className="hud-btn overlay-off" onClick={() => void stopSession()}>■ Stop</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <input
+                  placeholder="Session name (auto-generated if empty)"
+                  value={recSessionName}
+                  onChange={(e) => setRecSessionName(e.target.value)}
+                />
+                <input
+                  placeholder="What should this do?"
+                  value={recInstruction}
+                  onChange={(e) => setRecInstruction(e.target.value)}
+                />
+                <div className="hud-input-actions">
+                  <button className="hud-btn" onClick={() => void startSession()}>● Record</button>
+                </div>
+                {savedSessions.length > 0 && (
+                  <>
+                    <div style={{ borderTop: "1px solid rgba(170,214,255,0.12)", paddingTop: "4px", marginTop: "2px" }}>
+                      <div style={{ fontSize: "0.52rem", color: "rgba(148,163,184,0.6)", marginBottom: "3px" }}>Saved Sessions</div>
+                      <div style={{ maxHeight: "60px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "2px" }}>
+                        {savedSessions.map((s) => (
+                          <button
+                            key={s.session_id}
+                            className={`hud-btn ${selectedSession?.session_id === s.session_id ? "active" : ""}`}
+                            style={{ fontSize: "0.5rem", textAlign: "left", padding: "3px 6px" }}
+                            onClick={() => setSelectedSession(selectedSession?.session_id === s.session_id ? null : s)}
+                          >
+                            {s.name} — {formatDuration(Number(s.duration_ms))}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    {selectedSession && (
+                      <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "2px" }}>
+                        <button
+                          className="hud-btn"
+                          disabled={replaying || busy.run}
+                          onClick={() => void replaySession()}
+                          style={{ fontSize: "0.52rem" }}
+                        >
+                          {replaying ? "Replaying..." : "▶ Replay"}
+                        </button>
+                        {replaying && (
+                          <button
+                            className="hud-btn overlay-off"
+                            onClick={() => { replayStopRef.current = true; loopStopRef.current = true; }}
+                            style={{ fontSize: "0.52rem" }}
+                          >
+                            ■ Stop
+                          </button>
+                        )}
+                        <span style={{ fontSize: "0.48rem", color: "rgba(226,232,240,0.6)" }}>×</span>
+                        {infiniteRepeat ? (
+                          <button className="hud-btn active" onClick={() => setInfiniteRepeat(false)} style={{ fontSize: "0.52rem", padding: "2px 5px" }}>∞</button>
+                        ) : (
+                          <>
+                            <input
+                              type="number"
+                              min={1}
+                              max={999}
+                              value={repeatCount}
+                              onChange={(e) => setRepeatCount(Math.max(1, Number(e.target.value) || 1))}
+                              style={{ width: "32px", fontSize: "0.52rem", padding: "2px 4px", textAlign: "center" }}
+                            />
+                            <button className="hud-btn" onClick={() => setInfiniteRepeat(true)} style={{ fontSize: "0.48rem", padding: "2px 4px" }}>∞</button>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         </>
         )}
       </section>
@@ -989,6 +1267,23 @@ function MainApp() {
     null,
   );
   const [recordingsRoot, setRecordingsRoot] = useState("");
+
+  // Auto-fill instruction when a session is selected
+  useEffect(() => {
+    if (selectedSessionId) {
+      const session = sessions.find((s) => s.session_id === selectedSessionId);
+      if (session?.instruction) {
+        setInstruction(session.instruction);
+      }
+      if (session?.task_context) {
+        setTaskContext(session.task_context);
+      }
+      if (session?.model) {
+        setModel(session.model);
+      }
+    }
+  }, [selectedSessionId, sessions]);
+
   const [replayResult, setReplayResult] = useState<SessionReplayResult | null>(
     null,
   );
@@ -1010,6 +1305,7 @@ function MainApp() {
     replay: false,
   });
   const loopStopRef = useRef(false);
+  const replayStopRef = useRef(false);
   const [looping, setLooping] = useState(false);
 
   const pushLog = (entry: string) => {
@@ -1689,26 +1985,68 @@ function MainApp() {
       pushLog("replay blocked: select a session first");
       return;
     }
+    replayStopRef.current = false;
     setBusy((b) => ({ ...b, replay: true }));
+    setReplayResult(null);
+    const MAX_STEPS = 30;
+    const stepHistory: string[] = [];
     try {
-      const res = await invoke<SessionReplayResult>(
-        "replay_recording_session_cmd",
-        {
+      pushLog(`session replay started → ${selectedSessionId}`);
+      for (let step = 1; step <= MAX_STEPS; step++) {
+        if (replayStopRef.current) {
+          pushLog("replay stopped by user");
+          break;
+        }
+
+        pushModelActivity({ phase: "capture", step, max_steps: MAX_STEPS, message: "Capturing screen..." });
+        const captured = await invoke<CaptureFrame>("capture_primary_cmd");
+
+        pushModelActivity({ phase: "thinking", step, max_steps: MAX_STEPS, message: "Model is thinking..." });
+        const inferred = await invoke<VisionAction>("infer_click_cmd", {
           req: {
-            session_id: selectedSessionId,
+            png_path: captured.png_path,
             instruction: effectiveInstruction,
             model,
+            step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
           },
-        },
-      );
-      setReplayResult(res);
-      setVision(res.action);
-      pushLog(
-        `session replay -> ${res.session_id} action=${res.action.action} clicked=${res.clicked} monitor=${res.monitor_id}`,
-      );
+        });
+
+        if (inferred.action === "none" || replayStopRef.current) {
+          pushModelActivity({ phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason });
+          pushLog(`replay done at step ${step}: ${inferred.reason}`);
+          break;
+        }
+
+        if (inferred.action === "click") {
+          await invoke("execute_real_click_cmd", {
+            req: {
+              x_norm: inferred.x_norm, y_norm: inferred.y_norm,
+              screenshot_w_px: captured.screenshot_w_px, screenshot_h_px: captured.screenshot_h_px,
+              monitor_origin_x_pt: captured.monitor_origin_x_pt, monitor_origin_y_pt: captured.monitor_origin_y_pt,
+              scale_factor: captured.scale_factor, confidence: inferred.confidence,
+            },
+          });
+          stepHistory.push(`Step ${step}: click (${inferred.x_norm},${inferred.y_norm}) — ${inferred.reason}`);
+          pushModelActivity({ phase: "click", step, max_steps: MAX_STEPS, message: inferred.reason });
+        } else if (inferred.action === "hotkey" && inferred.keys?.length) {
+          await invoke("press_keys_cmd", { req: { keys: inferred.keys, delay_ms: 30 } });
+          const keyDesc = inferred.keys.map((k) => k.key).join("+");
+          stepHistory.push(`Step ${step}: hotkey ${keyDesc} — ${inferred.reason}`);
+          pushModelActivity({ phase: "hotkey", step, max_steps: MAX_STEPS, message: `${keyDesc} — ${inferred.reason}` });
+        } else if (inferred.action === "type" && inferred.text) {
+          await invoke("type_text_cmd", { text: inferred.text });
+          stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
+          pushModelActivity({ phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` });
+        }
+
+        setVision(inferred);
+        pushLog(`replay step ${step}: ${inferred.action} — ${inferred.reason}`);
+        await new Promise((r) => setTimeout(r, 800));
+      }
       await refreshRuntime(true);
     } catch (err) {
       pushLog(`session replay error: ${String(err)}`);
+      pushModelActivity({ phase: "error", step: 0, max_steps: MAX_STEPS, message: String(err) });
       if (String(err).includes("401")) {
         pushLog(
           'Provider auth failed: click "Validate API Key" and check OPENROUTER_API_KEY / MISTRAL_API_KEY in .env',
@@ -1806,8 +2144,8 @@ function MainApp() {
                     <strong>{hudEnabled ? "Visible" : "Hidden"}</strong>
                   </div>
                   <div className="health">
-                    <span>Action Counter</span>
-                    <strong>{runtime ? `${runtime.actions}/${runtime.max_actions}` : "n/a"}</strong>
+                    <span>Actions</span>
+                    <strong>{modelActivity.filter(s => s.phase === "click" || s.phase === "hotkey" || s.phase === "type").length}/{runtime?.max_actions ?? 30}</strong>
                   </div>
                 </div>
               </article>
@@ -1872,68 +2210,61 @@ function MainApp() {
                 <div className="card-head">
                   <h2>Sessions</h2>
                   <div className="row">
+                    {recordingStatus?.active ? (
+                      <button
+                        onClick={() => void stopRecording()}
+                        disabled={busy.recordStop}
+                        style={{ borderColor: "rgba(255,100,100,0.5)", color: "#ffc0c0" }}
+                      >
+                        {busy.recordStop ? "Stopping..." : "■ Stop Recording"}
+                      </button>
+                    ) : (
+                      <button
+                        className="primary"
+                        onClick={() => void startRecording()}
+                        disabled={busy.recordStart}
+                      >
+                        {busy.recordStart ? "Starting..." : "● Record"}
+                      </button>
+                    )}
+                    <button onClick={() => void refreshRecordingStatus()}>Refresh</button>
                     <button
-                      className="primary"
-                      onClick={() => void startRecording()}
-                      disabled={
-                        busy.recordStart || Boolean(recordingStatus?.active)
-                      }
+                      onClick={() => void openPath(recordingsRoot)}
+                      disabled={!recordingsRoot}
                     >
-                      {busy.recordStart ? "Starting..." : "Start Recording"}
-                    </button>
-                    <button
-                      onClick={() => void refreshRecordingStatus()}
-                      disabled={busy.recordStart || busy.recordStop}
-                    >
-                      Refresh
-                    </button>
-                    <button
-                      onClick={() => void stopRecording()}
-                      disabled={busy.recordStop || !recordingStatus?.active}
-                    >
-                      {busy.recordStop ? "Stopping..." : "Stop & Save"}
+                      Open Folder
                     </button>
                   </div>
                 </div>
-                <div className="json-grid">
-                  <div>
-                    <small>Recording Status</small>
-                    <pre>{JSON.stringify(recordingStatus, null, 2)}</pre>
+                <div className="health-grid" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
+                  <div className={`health ${recordingStatus?.active ? "ok" : ""}`}>
+                    <span>Status</span>
+                    <strong>{recordingStatus?.active ? "Recording" : "Idle"}</strong>
                   </div>
-                  <div>
-                    <small>Last Session Summary</small>
-                    <pre>{JSON.stringify(recordingSummary, null, 2)}</pre>
+                  <div className="health">
+                    <span>Frames</span>
+                    <strong>{recordingStatus?.frame_ticks ?? 0}</strong>
+                  </div>
+                  <div className="health">
+                    <span>Duration</span>
+                    <strong>{recordingStatus?.started_unix_ms ? formatDuration(Date.now() - Number(recordingStatus.started_unix_ms)) : "—"}</strong>
+                  </div>
+                  <div className="health">
+                    <span>Last Session</span>
+                    <strong>{recordingSummary ? `${recordingSummary.frame_ticks} frames` : "—"}</strong>
                   </div>
                 </div>
               </article>
 
               <article className="card">
                 <div className="card-head">
-                  <h3>Storage</h3>
+                  <h3>Saved Sessions</h3>
                   <div className="row">
-                    <button onClick={() => void loadRecordingsRoot()}>
-                      Refresh Root
-                    </button>
-                    <button onClick={() => void loadSessions()}>
-                      Refresh Sessions
-                    </button>
-                    <button
-                      onClick={() => void openPath(recordingsRoot)}
-                      disabled={!recordingsRoot}
-                    >
-                      Open Root Folder
-                    </button>
+                    <button onClick={() => void loadSessions()}>Refresh</button>
                   </div>
                 </div>
-                <p className="path">
-                  {recordingsRoot || "Loading root path..."}
-                </p>
-              </article>
-
-              <article className="card">
-                <h3>Saved Sessions</h3>
                 {sessions.length === 0 ? (
-                  <p className="muted">No saved sessions yet.</p>
+                  <p className="muted">No saved sessions yet. Record one above or via the HUD.</p>
                 ) : (
                   <div className="session-list">
                     {sessions.map((s) => (
@@ -1951,11 +2282,17 @@ function MainApp() {
                         }}
                       >
                         <div>
-                          <strong>{s.session_id}</strong>
+                          <strong>{s.name || s.session_id}</strong>
                           <small>
                             {s.frame_ticks} frames •{" "}
                             {formatDuration(s.duration_ms)} • {s.fps}fps
+                            {s.input_event_count ? ` • ${s.input_event_count} inputs` : ""}
                           </small>
+                          {s.instruction && (
+                            <small style={{ display: "block", opacity: 0.6, marginTop: "2px" }}>
+                              "{s.instruction}"
+                            </small>
+                          )}
                         </div>
                         <button
                           className="open-badge"
@@ -1975,49 +2312,60 @@ function MainApp() {
 
               <article className="card">
                 <h3>Replay Selected Session</h3>
-                <label>
-                  Instruction
-                  <input
-                    value={instruction}
-                    onChange={(e) => setInstruction(e.target.value)}
-                  />
-                </label>
-                <label>
-                  Task Context (sent with instruction)
-                  <textarea
-                    rows={4}
-                    value={taskContext}
-                    onChange={(e) => setTaskContext(e.target.value)}
-                  />
-                </label>
-                <label>
-                  Model
-                  <input
-                    value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                  />
-                </label>
-                <div className="row">
-                  <button
-                    className="primary"
-                    onClick={() => void replaySelectedSession()}
-                    disabled={busy.replay || !selectedSessionId}
-                  >
-                    {busy.replay ? "Running Replay..." : "Replay Session"}
-                  </button>
-                  <button
-                    onClick={() =>
-                      void openPath(
-                        sessions.find((s) => s.session_id === selectedSessionId)
-                          ?.output_dir ?? "",
-                      )
-                    }
-                    disabled={!selectedSessionId}
-                  >
-                    Open Session Folder
-                  </button>
-                </div>
-                <pre>{JSON.stringify(replayResult, null, 2)}</pre>
+                {selectedSessionId ? (
+                  <>
+                    <label>
+                      Instruction (auto-filled from session)
+                      <input
+                        value={instruction}
+                        onChange={(e) => setInstruction(e.target.value)}
+                      />
+                    </label>
+                    <label>
+                      Task Context (sent with instruction)
+                      <textarea
+                        rows={4}
+                        value={taskContext}
+                        onChange={(e) => setTaskContext(e.target.value)}
+                      />
+                    </label>
+                    <label>
+                      Model
+                      <input
+                        value={model}
+                        onChange={(e) => setModel(e.target.value)}
+                      />
+                    </label>
+                    <div className="row">
+                      <button
+                        className="primary"
+                        onClick={() => void replaySelectedSession()}
+                        disabled={busy.replay}
+                      >
+                        {busy.replay ? "Running Replay..." : "Replay Session"}
+                      </button>
+                      {busy.replay && (
+                        <button
+                          onClick={() => { replayStopRef.current = true; }}
+                        >
+                          Stop Replay
+                        </button>
+                      )}
+                      <button
+                        onClick={() =>
+                          void openPath(
+                            sessions.find((s) => s.session_id === selectedSessionId)
+                              ?.output_dir ?? "",
+                          )
+                        }
+                      >
+                        Open Session Folder
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="muted">Select a session above to replay it.</p>
+                )}
               </article>
             </>
           ) : null}

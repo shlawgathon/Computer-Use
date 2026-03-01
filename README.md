@@ -1,76 +1,153 @@
 # Agenticify
 
-OS-native vision automation app built with Tauri (Rust backend) + React (frontend).
+**OS-native vision automation agent** — record yourself, teach the AI, and let it repeat your workflows autonomously.
 
-## What Works Right Now
+Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on macOS with full screen capture, mouse/keyboard actuation, and a floating HUD that stays out of your way.
 
-- Real screen capture with `xcap`.
-- Real Mistral vision inference (`infer_click_cmd`).
-- Real OS mouse click actuation with `enigo` (`execute_real_click_cmd`).
-- Real session recording to disk (`start_recording_session_cmd` / `stop_recording_session_cmd`).
-- Real session replay from saved frames (`replay_recording_session_cmd`).
-- Transparent always-on-top overlay window with visual agent cursor.
-- Overlay spans the virtual desktop bounds across monitors (not just app window monitor).
-- macOS permission checks/prompts for:
-  - Screen Recording
-  - Accessibility
-- Safety controls:
-  - Global kill switch: `Cmd+Shift+Esc`
-  - Restore main window: `Cmd+Shift+Enter`
-  - max action cap (30) with auto E-STOP.
+---
 
-## How Components Communicate
+## Core Capabilities
 
-1. React UI triggers Tauri commands using `invoke(...)`.
-2. Rust backend captures screenshot frames with `xcap`.
-3. Rust backend sends image + instruction to Mistral and parses strict JSON output.
-4. Rust converts normalized coords into macOS logical points (Retina-aware scale handling).
-5. Rust executes real mouse movement + click through `enigo`.
-6. Rust emits `agent_cursor_event` so overlay cursor shows planned/clicked point.
-7. Rust returns state/results to UI for display.
+### Vision-First Agent Loop
 
-## Flow Diagrams
+- Captures the screen, sends it to a vision model (OpenRouter / Mistral), and executes the model's decision — all in a tight loop.
+- Supports **click**, **hotkey**, **type**, and **none** (task complete) actions.
+- Step history is passed between iterations so the agent remembers what it already did.
+- Configurable confidence threshold — low-confidence actions are rejected automatically.
+
+### Floating HUD (Always-On-Top)
+
+A compact, transparent pill that floats above everything — your command center without leaving your workflow.
+
+| Control    | What it does                                    |
+| ---------- | ----------------------------------------------- |
+| ☰ Menu    | Toggle the main dashboard window                |
+| ◉ Record   | Open the session recording panel                |
+| ✏️ Command | Type an instruction and run the agent loop      |
+| ▼ Activity | Live timestamped feed of every agent step       |
+| 🎯 Overlay | Toggle the visual cursor overlay (red when off) |
+| ◄ Collapse | Shrink HUD to a single circle, click to expand  |
+
+- **Elapsed timer** shows a running clock (▶ 0:05) during agent runs and (● 0:12) during recording.
+- **Activity feed** shows HH:MM:SS timestamps on every step.
+- Collapsible to a 40px circle centered on screen.
+
+### Session Recording & Replay
+
+Record yourself performing a task — the AI watches, learns, and can repeat it.
+
+**Recording captures:**
+
+- Screen frames (configurable FPS)
+- Mouse movements, clicks, and scroll events (via `rdev`)
+- Every keystroke — key presses and releases
+- Session name and instruction (what you're trying to do)
+
+**Replay features:**
+
+- Select any saved session and replay it with the AI
+- Auto-fills the instruction from the recording so the AI knows the goal
+- Repeat count: run once, N times, or ∞ (infinite loop until stopped)
+- Input events saved as `input_events.json` for full reconstruction
+
+**Save Runs:** Toggle "Save run" in the command panel — every agent run automatically records as a replayable session (frames + all input events captured during execution).
+
+### Transparent Overlay
+
+- Full-screen transparent window spanning all monitors.
+- Visual cursor shows exactly where the agent plans to click — with pulse animations.
+- Target icon in HUD: default color when active, red when disabled.
+
+### Safety Controls
+
+- **Global E-STOP**: `Cmd+Shift+Esc` — immediately halts all agent actions.
+- **Restore window**: `Cmd+Shift+Enter` — brings the dashboard back if minimized.
+- **Max action cap** (30 per run) with auto-stop.
+- Per-action confidence threshold gating.
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TD
-  A["Run One-Shot button"] --> B["capture_primary_cmd (xcap screenshot)"]
-  B --> C["infer_click_cmd (Mistral vision JSON)"]
-  C --> D{"action == click ?"}
-  D -- "no" --> E["Stop, log 'no click action'"]
-  D -- "yes" --> F["execute_real_click_cmd (enigo)"]
-  F --> G["Emit agent_cursor_event (move/click)"]
-  G --> H["Overlay draws cursor pulse"]
+    subgraph HUD["Floating HUD"]
+        CMD[Command Panel] --> LOOP[Agent Loop]
+        REC[Record Panel] --> SESSION[Session Recording]
+        ACT[Activity Feed] --> TS[Timestamped Steps]
+    end
+
+    subgraph Backend["Rust Backend"]
+        CAP[xcap Screen Capture] --> INF[Vision Model Inference]
+        INF --> EXEC{Action Router}
+        EXEC -->|click| MOUSE[enigo Mouse]
+        EXEC -->|hotkey| KEYS[enigo Keyboard]
+        EXEC -->|type| TYPE[enigo Text Input]
+        EXEC -->|none| DONE[Task Complete]
+        RDEV[rdev Input Listener] --> EVENTS[Input Events]
+    end
+
+    subgraph Storage["Session Storage"]
+        FRAMES[frame-*.png] --> MANIFEST[manifest.json]
+        EVENTS --> INPUT_JSON[input_events.json]
+    end
+
+    LOOP --> CAP
+    SESSION --> CAP
+    SESSION --> RDEV
+    MOUSE --> OVERLAY[Overlay Cursor Pulse]
 ```
 
-```mermaid
-flowchart TD
-  A["Start Recording"] --> B["Capture loop writes frame-*.png (2 FPS)"]
-  B --> C["Stop & Save writes manifest.json"]
-  C --> D["Replay Session"]
-  D --> E["Load latest frame in selected session"]
-  E --> F["infer_click_cmd"]
-  F --> G{"action == click ?"}
-  G -- "yes" --> H["execute_real_click_cmd"]
-  G -- "no" --> I["No click"]
-```
-
-## Where Data Is Stored
-
-- Root recording directory (macOS): `std::env::temp_dir()/agenticify-recordings`
-- Session layout:
+## Session Data Format
 
 ```text
 session-<unix-ms>/
-  manifest.json
+  manifest.json          # name, instruction, fps, frame count, duration, input event count
+  input_events.json      # mouse moves, clicks, key presses/releases, scroll events
   monitor-<id>/
     frame-000001.png
     frame-000002.png
     ...
 ```
 
-- In UI, open **Sessions** tab:
-  - `Open Root Folder`
-  - `Open` on any saved session row
+**manifest.json:**
+
+```json
+{
+  "session_id": "session-1709312400000",
+  "name": "Open Chrome and search",
+  "instruction": "Open Chrome, navigate to google.com, search for Tauri",
+  "fps": 2,
+  "frame_ticks": 24,
+  "duration_ms": 12000,
+  "input_event_count": 142
+}
+```
+
+## Dashboard
+
+| Tab           | Purpose                                                                                                            |
+| ------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **Run**       | Permissions, API key status, E-STOP, overlay/HUD toggles, action counter, live command execution                   |
+| **Sessions**  | Recording status cards, saved session list with names/instructions/input counts, replay with instruction auto-fill |
+| **Dev Tools** | Step-by-step capture/infer/click controls, raw state inspection                                                    |
+
+All status indicators use clean health-card style — no raw JSON dumps.
+
+---
+
+## Tech Stack
+
+| Layer                    | Technology                                |
+| ------------------------ | ----------------------------------------- |
+| Framework                | Tauri 2 (Rust + WebView)                  |
+| Frontend                 | React + TypeScript + Vite                 |
+| Screen Capture           | `xcap`                                    |
+| Mouse/Keyboard Actuation | `enigo`                                   |
+| Input Event Capture      | `rdev` (global mouse/keyboard listener)   |
+| Vision Model             | OpenRouter API (Mistral, configurable)    |
+| HTTP Client              | `reqwest` + `openrouter-rs`               |
+| Styling                  | Vanilla CSS with glassmorphism, dark mode |
 
 ## Environment
 
@@ -79,51 +156,47 @@ Create `.env` in repo root:
 ```bash
 OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
 OPENROUTER_API_BASE=https://openrouter.ai/api/v1
-# optional fallback provider:
-MISTRAL_API_KEY=YOUR_MISTRAL_KEY
-MISTRAL_API_BASE=https://api.mistral.ai/v1
 AGENT_CONFIDENCE_THRESHOLD=0.60
 AGENT_INFER_MAX_DIM=960
-AGENT_MISTRAL_MAX_ATTEMPTS=3
 ```
 
-## Run (Bun + Tauri)
+## Run
 
 ```bash
 bun install
 bun run tauri:dev
 ```
 
-If Vite/esbuild fails, run `bun install` again and retry.
+Requires macOS with **Screen Recording** and **Accessibility** permissions (prompted on first launch).
 
-## UI Structure
+## Backend Commands
 
-- `Run`: permissions, capture/infer/click controls, safety, runtime JSON.
-- `Sessions`: start/stop recording, list saved sessions, replay selected session.
-- `Diagnostics`: communication flow, storage map, failure checks.
-- Overlay controls are in header:
-  - `Show Overlay` / `Hide Overlay`
-  - `Preview Cursor`
-- Top HUD controls are in header:
-  - `Show Top HUD` / `Hide Top HUD`
-- Top HUD is a separate always-on-top floating window (Cluely-style).
-- Double-click the top HUD notch to restore the main Agenticify window if it is minimized.
-- `Task Context` textarea is included in Run/Sessions and is appended to the instruction sent to Mistral.
+### Core
 
-## Key Rust Commands
+| Command                  | Description                                   |
+| ------------------------ | --------------------------------------------- |
+| `capture_primary_cmd`    | Capture primary monitor screenshot            |
+| `infer_click_cmd`        | Send screenshot + instruction to vision model |
+| `execute_real_click_cmd` | Perform mouse click at normalized coordinates |
+| `press_keys_cmd`         | Execute keyboard shortcuts                    |
+| `type_text_cmd`          | Type text string                              |
 
-- `check_permissions_cmd`
-- `request_permissions_cmd`
-- `env_status_cmd`
-- `capture_primary_cmd`
-- `infer_click_cmd`
-- `execute_real_click_cmd`
-- `recording_status_cmd`
-- `start_recording_session_cmd`
-- `stop_recording_session_cmd`
-- `recordings_root_cmd`
-- `list_recording_sessions_cmd`
-- `replay_recording_session_cmd`
-- `open_path_cmd`
-- `set_estop_cmd`
-- `get_runtime_state_cmd`
+### Sessions (recording.rs)
+
+| Command              | Description                                   |
+| -------------------- | --------------------------------------------- |
+| `start_session_cmd`  | Start recording (frames + rdev input capture) |
+| `stop_session_cmd`   | Stop recording, save manifest + input events  |
+| `session_status_cmd` | Get current recording status                  |
+| `list_sessions_cmd`  | List all saved sessions                       |
+| `load_session_cmd`   | Load a specific session manifest              |
+| `delete_session_cmd` | Delete a saved session                        |
+
+### System
+
+| Command                   | Description                              |
+| ------------------------- | ---------------------------------------- |
+| `check_permissions_cmd`   | Check macOS permissions                  |
+| `request_permissions_cmd` | Prompt for permissions                   |
+| `set_estop_cmd`           | Toggle emergency stop                    |
+| `get_runtime_state_cmd`   | Get runtime state (E-STOP, action count) |

@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod recording;
+
 
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::{Deserialize, Serialize};
@@ -151,6 +153,14 @@ struct RecordingSummary {
     fps: u32,
     frame_ticks: u64,
     duration_ms: u128,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    instruction: String,
+    #[serde(default)]
+    task_context: String,
+    #[serde(default)]
+    model: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -947,6 +957,10 @@ fn stop_recording_session_cmd(
         fps: active.fps,
         frame_ticks: active.frame_ticks.load(Ordering::SeqCst),
         duration_ms: finished_unix_ms.saturating_sub(active.started_unix_ms),
+        name: String::new(),
+        instruction: String::new(),
+        task_context: String::new(),
+        model: String::new(),
     };
 
     let manifest = json!({
@@ -1340,6 +1354,7 @@ fn main() {
         .manage(RuntimeGuards::default())
         .manage(DisplayState::default())
         .manage(RecordingState::default())
+        .manage(recording::SessionRecordingState::default())
         .setup(|app| {
             let display_state = app.state::<DisplayState>();
             init_display_scale(&display_state);
@@ -1402,6 +1417,12 @@ fn main() {
             execute_real_click_cmd,
             press_keys_cmd,
             type_text_cmd,
+            recording::start_session_cmd,
+            recording::stop_session_cmd,
+            recording::session_status_cmd,
+            recording::list_sessions_cmd,
+            recording::load_session_cmd,
+            recording::delete_session_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
