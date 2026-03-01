@@ -1110,6 +1110,41 @@ fn capture_primary_cmd(display_state: State<DisplayState>) -> Result<CaptureFram
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct FrontmostApp {
+    app_name: String,
+    window_title: String,
+}
+
+#[tauri::command]
+fn get_frontmost_app_cmd() -> Result<FrontmostApp, String> {
+    let script = r#"
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            try
+                set winTitle to name of front window of (first application process whose frontmost is true)
+            on error
+                set winTitle to ""
+            end try
+            return frontApp & "|||" & winTitle
+        end tell
+    "#;
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| format!("osascript failed: {}", e))?;
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parts: Vec<&str> = raw.splitn(2, "|||").collect();
+
+    Ok(FrontmostApp {
+        app_name: parts.first().unwrap_or(&"").to_string(),
+        window_title: parts.get(1).unwrap_or(&"").to_string(),
+    })
+}
+
 #[tauri::command]
 async fn infer_click_cmd(req: InferClickRequest) -> Result<VisionAction, String> {
     use openrouter_rs::{
@@ -1637,12 +1672,15 @@ fn main() {
             press_keys_cmd,
             type_text_cmd,
             run_shell_cmd,
+            get_frontmost_app_cmd,
             recording::start_session_cmd,
             recording::stop_session_cmd,
             recording::session_status_cmd,
             recording::list_sessions_cmd,
             recording::load_session_cmd,
             recording::delete_session_cmd,
+            recording::save_activity_log_cmd,
+            recording::load_activity_log_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

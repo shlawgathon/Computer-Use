@@ -450,3 +450,44 @@ pub fn delete_session_cmd(session_id: String) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ── Activity Log Persistence ───────────────────────────
+
+#[tauri::command]
+pub fn save_activity_log_cmd(
+    session_id: String,
+    activity_log: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let dir = recordings_root().join(&session_id);
+    if !dir.exists() {
+        return Err(format!("Session '{}' not found", session_id));
+    }
+
+    let path = dir.join("activity_log.json");
+    let json = serde_json::to_string_pretty(&activity_log).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+
+    println!(
+        "[recording] saved activity log for '{}': {} entries",
+        session_id,
+        activity_log.len()
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn load_activity_log_cmd(
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let path = recordings_root().join(&session_id).join("activity_log.json");
+
+    if !path.exists() {
+        // Graceful fallback for old sessions without an activity log
+        return Ok(Vec::new());
+    }
+
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let log: Vec<serde_json::Value> =
+        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(log)
+}

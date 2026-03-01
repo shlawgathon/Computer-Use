@@ -47,6 +47,16 @@ type CaptureFrame = {
   capture_ms: number;
 };
 
+type FrontmostApp = { app_name: string; window_title: string };
+
+async function getWindowContext(): Promise<string> {
+  try {
+    const info = await invoke<FrontmostApp>("get_frontmost_app_cmd");
+    const parts = [info.app_name, info.window_title].filter(Boolean);
+    return parts.length > 0 ? `Currently active window: ${parts.join(" — ")}` : "";
+  } catch { return ""; }
+}
+
 type KeyAction = {
   key: string;
   direction?: "press" | "release" | "click";
@@ -154,6 +164,12 @@ const HUD_LABEL = "hud";
 const HUD_QUERY_KEY = "hud";
 const MAIN_LABEL = "main";
 const DEFAULT_HUD_MODEL = "mistralai/ministral-14b-2512";
+
+const MODEL_OPTIONS = [
+  { id: "mistralai/mistral-large-2512", label: "Mistral Large 3 (Flagship)" },
+  { id: "mistralai/mistral-small-3.1-24b-instruct", label: "Mistral Small 3.1 (24B)" },
+  { id: "mistralai/ministral-14b-2512", label: "Ministral 14B (Default)" },
+] as const;
 const HUD_WIDTH = 460;
 const HUD_HEIGHT = 42;
 
@@ -291,7 +307,6 @@ async function ensureHudWindow(): Promise<WebviewWindow> {
     focus: true,
     resizable: false,
     shadow: false,
-    acceptFirstMouse: true,
     x,
     y,
     width,
@@ -765,7 +780,7 @@ function HudWindow() {
       await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
     } else {
       setHudPanel(panel);
-      const h = panel === "activity" ? 180 : panel === "record" ? 155 : 200;
+      const h = panel === "activity" ? 180 : panel === "record" ? 240 : 200;
       await win.setFocusable(panel === "command" || panel === "record").catch(() => undefined);
       await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
       await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
@@ -837,6 +852,7 @@ function HudWindow() {
     setReplaying(true);
     const loops = infiniteRepeat ? Infinity : Math.max(1, repeatCount);
     const inst = selectedSession.instruction || hudInstruction || "Repeat the recorded task";
+    const collectedSteps: AgentStep[] = [];
     try {
       for (let rep = 0; rep < loops; rep++) {
         if (replayStopRef.current) break;
@@ -848,16 +864,30 @@ function HudWindow() {
         for (let step = 1; step <= MAX_STEPS; step++) {
           if (loopStopRef.current || replayStopRef.current) break;
           const captured = await invoke<CaptureFrame>("capture_primary_cmd");
+          if (loopStopRef.current || replayStopRef.current) {
+            const stopStep: AgentStep = { phase: "done", step, max_steps: MAX_STEPS, message: "Stopped by user" };
+            collectedSteps.push(stopStep);
+            await emit("agent_step", stopStep).catch(() => undefined);
+            break;
+          }
           const inferred = await invoke<VisionAction>("infer_click_cmd", {
             req: {
               png_path: captured.png_path,
               instruction: inst,
               model: DEFAULT_HUD_MODEL,
-              step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
+              step_context: [await getWindowContext(), ...stepHistory].filter(Boolean).join("\n") || undefined,
             },
           });
-          if (inferred.action === "none" || loopStopRef.current || replayStopRef.current) {
-            await emit("agent_step", { phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason } as AgentStep).catch(() => undefined);
+          if (loopStopRef.current || replayStopRef.current) {
+            const stopStep: AgentStep = { phase: "done", step, max_steps: MAX_STEPS, message: "Stopped by user" };
+            collectedSteps.push(stopStep);
+            await emit("agent_step", stopStep).catch(() => undefined);
+            break;
+          }
+          if (inferred.action === "none") {
+            const doneStep: AgentStep = { phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason };
+            collectedSteps.push(doneStep);
+            await emit("agent_step", doneStep).catch(() => undefined);
             break;
           }
           if (inferred.action === "click") {
@@ -876,6 +906,7 @@ function HudWindow() {
             stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
           }
           const s: AgentStep = { phase: inferred.action as AgentStep["phase"], step, max_steps: MAX_STEPS, message: inferred.reason };
+          collectedSteps.push(s);
           await emit("agent_step", s).catch(() => undefined);
           await new Promise(r => setTimeout(r, 800));
         }
@@ -886,6 +917,13 @@ function HudWindow() {
         }
       }
     } finally {
+      // Save collected activity to the session
+      if (selectedSession && collectedSteps.length > 0) {
+        invoke("save_activity_log_cmd", {
+          sessionId: selectedSession.session_id,
+          activityLog: collectedSteps,
+        }).catch(() => { /* best-effort */ });
+      }
       setReplaying(false);
       setLooping(false);
       setBusy((b) => ({ ...b, run: false }));
@@ -899,6 +937,7 @@ function HudWindow() {
     const MAX_STEPS = 30;
     const inst = hudInstruction || status.instruction || "Click the target button";
     const stepHistory: string[] = [];
+    const collectedSteps: AgentStep[] = [];
 
     // Auto-save run as session if toggled on
     if (saveRun) {
@@ -921,11 +960,13 @@ function HudWindow() {
         if (loopStopRef.current) break;
 
         const captureStep: AgentStep = { phase: "capture", step, max_steps: MAX_STEPS, message: "Capturing screen..." };
+        collectedSteps.push(captureStep);
         await emit("agent_step", captureStep).catch(() => undefined);
 
         const captured = await invoke<CaptureFrame>("capture_primary_cmd");
 
         const thinkStep: AgentStep = { phase: "thinking", step, max_steps: MAX_STEPS, message: "Model is thinking..." };
+        collectedSteps.push(thinkStep);
         await emit("agent_step", thinkStep).catch(() => undefined);
 
         const inferred = await invoke<VisionAction>("infer_click_cmd", {
@@ -933,12 +974,13 @@ function HudWindow() {
             png_path: captured.png_path,
             instruction: inst,
             model: DEFAULT_HUD_MODEL,
-            step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
+            step_context: [await getWindowContext(), ...stepHistory].filter(Boolean).join("\n") || undefined,
           },
         });
 
         if (inferred.action === "none" || loopStopRef.current) {
           const doneStep: AgentStep = { phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason };
+          collectedSteps.push(doneStep);
           await emit("agent_step", doneStep).catch(() => undefined);
           break;
         }
@@ -954,22 +996,26 @@ function HudWindow() {
           });
           stepHistory.push(`Step ${step}: clicked at (${inferred.x_norm}, ${inferred.y_norm}) — ${inferred.reason}`);
           const s: AgentStep = { phase: "click", step, max_steps: MAX_STEPS, message: inferred.reason };
+          collectedSteps.push(s);
           await emit("agent_step", s).catch(() => undefined);
         } else if (inferred.action === "hotkey" && inferred.keys?.length) {
           await invoke("press_keys_cmd", { req: { keys: inferred.keys, delay_ms: 30 } });
           const keyDesc = inferred.keys.map((k) => k.key).join("+");
           stepHistory.push(`Step ${step}: hotkey ${keyDesc} — ${inferred.reason}`);
           const s: AgentStep = { phase: "hotkey", step, max_steps: MAX_STEPS, message: `${keyDesc} — ${inferred.reason}` };
+          collectedSteps.push(s);
           await emit("agent_step", s).catch(() => undefined);
         } else if (inferred.action === "type" && inferred.text) {
           await invoke("type_text_cmd", { text: inferred.text });
           stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
           const s: AgentStep = { phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` };
+          collectedSteps.push(s);
           await emit("agent_step", s).catch(() => undefined);
         } else if (inferred.action === "shell" && inferred.command) {
           const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
           stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
           const s: AgentStep = { phase: "shell", step, max_steps: MAX_STEPS, message: `\`${inferred.command}\` — ${inferred.reason}` };
+          collectedSteps.push(s);
           await emit("agent_step", s).catch(() => undefined);
         }
 
@@ -977,13 +1023,19 @@ function HudWindow() {
       }
     } catch (err) {
       const errStep: AgentStep = { phase: "error", step: 0, max_steps: MAX_STEPS, message: String(err) };
+      collectedSteps.push(errStep);
       await emit("agent_step", errStep).catch(() => undefined);
     } finally {
       // Stop session recording if it was started
       if (saveRun) {
         try {
-          await invoke("stop_session_cmd");
+          const manifest = await invoke<SessionManifest>("stop_session_cmd");
           setRecActive(false);
+          // Save the activity log to the newly created session
+          await invoke("save_activity_log_cmd", {
+            sessionId: manifest.session_id,
+            activityLog: collectedSteps,
+          }).catch(() => { /* best-effort */ });
           void refreshSessions();
         } catch { /* best-effort */ }
       }
@@ -1318,7 +1370,7 @@ function MainApp() {
   const [vision, setVision] = useState<VisionAction | null>(null);
   const [instruction, setInstruction] = useState("Click the Save button");
   const [taskContext, setTaskContext] = useState(
-    "Goal: complete the task using clicks and keyboard shortcuts.\nUse Cmd+Tab to switch apps if the target app is not visible.\nReturn action=none only when the goal is fully achieved.",
+    "Goal: complete the task using all available actions — clicking, typing text, keyboard shortcuts (hotkeys), and shell commands.\nAfter using Cmd+Space to open Spotlight, always TYPE the app name, then press Return.\nUse Cmd+Tab to switch apps if the target app is not visible.\nReturn action=none only when the goal is fully achieved.",
   );
   const [model, setModel] = useState("mistralai/ministral-14b-2512");
 
@@ -1332,7 +1384,7 @@ function MainApp() {
   );
   const [recordingsRoot, setRecordingsRoot] = useState("");
 
-  // Auto-fill instruction when a session is selected
+  // Auto-fill instruction and load activity log when a session is selected
   useEffect(() => {
     if (selectedSessionId) {
       const session = sessions.find((s) => s.session_id === selectedSessionId);
@@ -1345,6 +1397,16 @@ function MainApp() {
       if (session?.model) {
         setModel(session.model);
       }
+      // Load saved activity log for this session
+      invoke<AgentStep[]>("load_activity_log_cmd", { sessionId: selectedSessionId })
+        .then((log) => {
+          if (log && log.length > 0) {
+            setModelActivity(log);
+          }
+        })
+        .catch(() => { /* old sessions may not have activity logs */ });
+    } else {
+      setModelActivity([]);
     }
   }, [selectedSessionId, sessions]);
 
@@ -1891,7 +1953,7 @@ function MainApp() {
               png_path: captured.png_path,
               instruction: effectiveInstruction,
               model,
-              step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
+              step_context: [await getWindowContext(), ...stepHistory].filter(Boolean).join("\n") || undefined,
             },
           });
           setVision(inferred);
@@ -2085,21 +2147,24 @@ function MainApp() {
           break;
         }
 
-        pushModelActivity({ phase: "capture", step, max_steps: MAX_STEPS, message: "Capturing screen..." });
+        const captureStep: AgentStep = { phase: "capture", step, max_steps: MAX_STEPS, message: "Capturing screen..." };
+        pushModelActivity(captureStep); await emit("agent_step", captureStep).catch(() => undefined);
         const captured = await invoke<CaptureFrame>("capture_primary_cmd");
 
-        pushModelActivity({ phase: "thinking", step, max_steps: MAX_STEPS, message: "Model is thinking..." });
+        const thinkStep: AgentStep = { phase: "thinking", step, max_steps: MAX_STEPS, message: "Model is thinking..." };
+        pushModelActivity(thinkStep); await emit("agent_step", thinkStep).catch(() => undefined);
         const inferred = await invoke<VisionAction>("infer_click_cmd", {
           req: {
             png_path: captured.png_path,
             instruction: effectiveInstruction,
             model,
-            step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
+            step_context: [await getWindowContext(), ...stepHistory].filter(Boolean).join("\n") || undefined,
           },
         });
 
         if (inferred.action === "none" || replayStopRef.current) {
-          pushModelActivity({ phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason });
+          const doneStep: AgentStep = { phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason };
+          pushModelActivity(doneStep); await emit("agent_step", doneStep).catch(() => undefined);
           pushLog(`replay done at step ${step}: ${inferred.reason}`);
           break;
         }
@@ -2114,20 +2179,24 @@ function MainApp() {
             },
           });
           stepHistory.push(`Step ${step}: click (${inferred.x_norm},${inferred.y_norm}) — ${inferred.reason}`);
-          pushModelActivity({ phase: "click", step, max_steps: MAX_STEPS, message: inferred.reason });
+          const clickStep: AgentStep = { phase: "click", step, max_steps: MAX_STEPS, message: inferred.reason };
+          pushModelActivity(clickStep); await emit("agent_step", clickStep).catch(() => undefined);
         } else if (inferred.action === "hotkey" && inferred.keys?.length) {
           await invoke("press_keys_cmd", { req: { keys: inferred.keys, delay_ms: 30 } });
           const keyDesc = inferred.keys.map((k) => k.key).join("+");
           stepHistory.push(`Step ${step}: hotkey ${keyDesc} — ${inferred.reason}`);
-          pushModelActivity({ phase: "hotkey", step, max_steps: MAX_STEPS, message: `${keyDesc} — ${inferred.reason}` });
+          const hotkeyStep: AgentStep = { phase: "hotkey", step, max_steps: MAX_STEPS, message: `${keyDesc} — ${inferred.reason}` };
+          pushModelActivity(hotkeyStep); await emit("agent_step", hotkeyStep).catch(() => undefined);
         } else if (inferred.action === "type" && inferred.text) {
           await invoke("type_text_cmd", { text: inferred.text });
           stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
-          pushModelActivity({ phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` });
+          const typeStep: AgentStep = { phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` };
+          pushModelActivity(typeStep); await emit("agent_step", typeStep).catch(() => undefined);
         } else if (inferred.action === "shell" && inferred.command) {
           const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
           stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
-          pushModelActivity({ phase: "shell", step, max_steps: MAX_STEPS, message: `\`${inferred.command}\` — ${inferred.reason}` });
+          const shellStep: AgentStep = { phase: "shell", step, max_steps: MAX_STEPS, message: `\`${inferred.command}\` — ${inferred.reason}` };
+          pushModelActivity(shellStep); await emit("agent_step", shellStep).catch(() => undefined);
         }
 
         setVision(inferred);
@@ -2138,6 +2207,7 @@ function MainApp() {
     } catch (err) {
       pushLog(`session replay error: ${String(err)}`);
       pushModelActivity({ phase: "error", step: 0, max_steps: MAX_STEPS, message: String(err) });
+      await emit("agent_step", { phase: "error", step: 0, max_steps: MAX_STEPS, message: String(err) } as AgentStep).catch(() => undefined);
       if (String(err).includes("401")) {
         pushLog(
           'Provider auth failed: click "Validate API Key" and check OPENROUTER_API_KEY / MISTRAL_API_KEY in .env',
@@ -2145,6 +2215,13 @@ function MainApp() {
       }
       maybeLogRateLimitHint(err, "session replay");
     } finally {
+      // Persist activity log to the session
+      if (selectedSessionId) {
+        invoke("save_activity_log_cmd", {
+          sessionId: selectedSessionId,
+          activityLog: modelActivity,
+        }).catch(() => { /* best-effort */ });
+      }
       setBusy((b) => ({ ...b, replay: false }));
     }
   };
@@ -2258,10 +2335,14 @@ function MainApp() {
                 </label>
                 <label>
                   Model
-                  <input
+                  <select
                     value={model}
                     onChange={(e) => setModel(e.target.value)}
-                  />
+                  >
+                    {MODEL_OPTIONS.map((m) => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
+                  </select>
                 </label>
                 <div className="row">
                   <button
@@ -2420,10 +2501,14 @@ function MainApp() {
                     </label>
                     <label>
                       Model
-                      <input
+                      <select
                         value={model}
                         onChange={(e) => setModel(e.target.value)}
-                      />
+                      >
+                        {MODEL_OPTIONS.map((m) => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                      </select>
                     </label>
                     <div className="row">
                       <button
@@ -2526,7 +2611,29 @@ function MainApp() {
         </section>
 
         <aside className="card side">
-          <h3>Model Activity</h3>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <h3>Model Activity</h3>
+            {modelActivity.length > 0 && (
+              <button
+                className="btn"
+                style={{ fontSize: "0.7rem", padding: "3px 8px" }}
+                onClick={() => {
+                  const md = modelActivity
+                    .map((a) => `- **[${a.phase.toUpperCase()}]** ${a.step > 0 ? `[${a.step}/${a.max_steps}] ` : ""}${a.message}`)
+                    .join("\n");
+                  const blob = new Blob([`# Model Activity\n\n${md}\n`], { type: "text/markdown" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = "model-activity.md";
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+              >
+                Export .md
+              </button>
+            )}
+          </div>
           <div className="model-activity" ref={modelActivityRef}>
             {modelActivity.length === 0 ? (
               <div className="model-activity-item" style={{ opacity: 0.5 }}>
