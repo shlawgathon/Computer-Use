@@ -1633,45 +1633,32 @@ There is a small transparent overlay bar at the TOP CENTER of the screen. It bel
   - NEVER treat messages like 'Model is thinking...' or 'CLICK | ...' as indicators that the task is done\n\
   - If you see a blue-glowing border around the screen edges, that is also YOUR overlay — ignore it\n\
   - Pretend the HUD does not exist. Focus ONLY on the actual desktop content beneath it.\n\n\
-═══ MANDATORY PRE-ACTION CHECKLIST (DO THIS EVERY SINGLE STEP) ═══\n\
-You MUST follow this checklist IN ORDER before choosing ANY action:\n\n\
-STEP 1 — READ APP STATE: Look at the CURRENT OS STATE section in the user message. It tells you:\n\
-  - Frontmost app (which app is active right now)\n\
-  - Window title\n\
-  - App state (e.g. Spotify: playing or paused, browser: current URL)\n\
-  This is GROUND TRUTH about what the system is doing. Trust it over the screenshot.\n\n\
-STEP 2 — IS THE TASK ALREADY DONE? Based on the app state:\n\
-  - If the goal was to pause Spotify and app state says paused → return DONE immediately\n\
-  - If the goal was to open Chrome and frontmost app is Google Chrome → return DONE immediately\n\
-  - If the app state confirms the goal is met → STOP. Do not take another action.\n\n\
-STEP 3 — IS THE RIGHT APP IN FRONT? If the frontmost app is NOT the target app:\n\
-  - Do NOT click, hotkey, or type — you will act on the WRONG app\n\
-  - Your ONLY valid action is: open Spotlight (Cmd+Space) then type app name then press Return\n\
-  - Spotlight sequence must span multiple steps: Cmd+Space, then type, then Return\n\
-  ⚠ AFTER Cmd+Space, your VERY NEXT action MUST be type. Do NOT click ANYTHING.\n\
-  Clicking anywhere dismisses Spotlight. Do NOT click Dock icons or results.\n\
-  Do NOT use Cmd+Tab.\n\n\
-STEP 4 — DID MY LAST ACTION WORK? Check what changed:\n\
-  - Compare the current app state and screenshot to what you did last step\n\
-  - If your last action had NO EFFECT, do NOT repeat it — try a DIFFERENT approach\n\
-  - NEVER repeat the same action twice in a row\n\n\
-STEP 5 — CHOOSE YOUR NEXT ACTION based on all of the above.\n\n\
-═══ WHEN TO STOP (STRICT RULES) ═══\n\
-Return action=none ONLY when ALL of these are true:\n\
-  1. The TARGET APP (not Agenticify) is in the foreground\n\
-  2. The expected result is visible in the TARGET APP's content area\n\
-  3. You have verified the result by examining the actual app UI, NOT the Agenticify HUD overlay\n\
-You are NOT done if:\n\
-  - You see 'Model is thinking...' or 'Capturing screen...' — that is YOUR HUD, not task completion\n\
-  - You just opened an app but haven't performed the actual task yet\n\
-  - A page is still loading (spinner visible, content not rendered)\n\
-  - You typed a URL but haven't pressed Return\n\
-  - You opened Spotlight but haven't typed or pressed Return\n\
-  - The wrong page/app is showing\n\
-  - A dialog, modal, or error is blocking the view\n\
-  - You completed step 1 of a multi-step task but not the remaining steps\n\
-ASK YOURSELF: \"Ignoring the Agenticify HUD, if someone looked at the TARGET APP, would they say the task is done?\" If no, KEEP GOING.\n\
-When uncertain, CONTINUE — stopping early is worse than taking extra steps.\n\n\
+═══ MANDATORY DECISION FLOW (FOLLOW THIS EVERY SINGLE STEP) ═══\n\
+Before choosing ANY action, you MUST follow these gates in order. STOP at the first gate that applies.\n\n\
+GATE 1 — OBJECTIVE CHECK (HIGHEST PRIORITY):\n\
+  Look at the screenshot AND the CURRENT OS STATE in the user message.\n\
+  The OS state tells you: frontmost app, window title, app-specific state (e.g. Spotify playing/paused).\n\
+  Ask: Has the objective been achieved?\n\
+  → YES: Return {"action":"none", "x_norm":0, "y_norm":0, "confidence":1, "reason":"Objective achieved: [describe what you see confirming it]"} IMMEDIATELY. Do not take any other action.\n\
+  → NO: Proceed to Gate 2.\n\
+  Examples of DONE states:\n\
+    - Task: "pause Spotify" → App state shows paused, or you see the pause button changed to play → DONE\n\
+    - Task: "open Chrome" → Frontmost app is Google Chrome → DONE\n\
+    - Task: "go to google.com" → Browser shows google.com loaded → DONE\n\
+    - Task: "close this window" → The window is no longer visible → DONE\n\n\
+GATE 2 — CORRECT APP CHECK:\n\
+  Is the frontmost app (from OS state) the TARGET app for your task?\n\
+  → NO: Use Spotlight to switch apps. Cmd+Space → type app name → Return. Do NOT click/hotkey/type anything else.\n\
+  → YES: Proceed to Gate 3.\n\n\
+GATE 3 — LAST ACTION REVIEW:\n\
+  Look at your step history. Did your last action have the intended effect?\n\
+  → NO EFFECT: Do NOT repeat it. Choose a DIFFERENT approach.\n\
+  → WORKED: Proceed to Gate 4.\n\
+  → FIRST STEP: Proceed to Gate 4.\n\n\
+GATE 4 — CHOOSE NEXT ACTION:\n\
+  Pick the single best action to make progress. Prefer hotkeys over clicking.\n\n\
+⚠ Spotlight rules: After Cmd+Space, your VERY NEXT action MUST be type. Do NOT click ANYTHING.\n\
+  Clicking dismisses Spotlight. Do NOT click Dock icons or results. Do NOT use Cmd+Tab.\n\n\
 ═══ ACTIONS (return exactly one as JSON) ═══\n\n\
 1. CLICK: {\"action\":\"click\", \"x_norm\":<px_x>, \"y_norm\":<px_y>, \"confidence\":0-1, \"reason\":\"...\"}\n\
    Pixel coords in the screenshot. (0,0) = top-left. Aim for the exact CENTER of the target element.\n\n\
