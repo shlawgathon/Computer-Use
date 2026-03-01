@@ -1,0 +1,1252 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+
+use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{
+    fs,
+    io::Cursor,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tauri::{Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{Code, Modifiers, ShortcutState};
+use xcap::Monitor;
+
+const MAX_ACTIONS_PER_RUN: u32 = 30;
+const DEFAULT_MISTRAL_MODEL: &str = "mistralai/ministral-14b-2512";
+const DEFAULT_MISTRAL_BASE: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.60;
+const DEFAULT_INFER_MAX_DIM: u32 = 1400;
+
+#[derive(Default)]
+struct RuntimeGuards {
+    estop: AtomicBool,
+    actions: AtomicU32,
+}
+
+#[derive(Default)]
+struct DisplayState {
+    primary_scale_factor: Arc<RwLock<f64>>,
+}
+
+#[derive(Default)]
+struct RecordingState {
+    active: Mutex<Option<ActiveRecording>>,
+}
+
+struct ActiveRecording {
+    session_id: String,
+    output_dir: PathBuf,
+    fps: u32,
+    started_unix_ms: u128,
+    stop_flag: Arc<AtomicBool>,
+    frame_ticks: Arc<AtomicU64>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PermissionState {
+    screen_recording: bool,
+    accessibility: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CaptureFrame {
+    monitor_id: u32,
+    monitor_origin_x_pt: i32,
+    monitor_origin_y_pt: i32,
+    screenshot_w_px: u32,
+    screenshot_h_px: u32,
+    scale_factor: f64,
+    png_path: String,
+    capture_ms: u128,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InferClickRequest {
+    png_path: String,
+    instruction: String,
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClickRequest {
+    x_norm: f64,
+    y_norm: f64,
+    screenshot_w_px: u32,
+    screenshot_h_px: u32,
+    monitor_origin_x_pt: i32,
+    monitor_origin_y_pt: i32,
+    scale_factor: f64,
+    confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VisionAction {
+    action: String,
+    x_norm: f64,
+    y_norm: f64,
+    confidence: f64,
+    reason: String,
+    model_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeState {
+    estop: bool,
+    actions: u32,
+    max_actions: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EnvStatus {
+    mistral_api_key_loaded: bool,
+    mistral_api_base: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MistralAuthStatus {
+    ok: bool,
+    http_status: Option<u16>,
+    message: String,
+    mistral_api_base: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecordingStatus {
+    active: bool,
+    session_id: Option<String>,
+    output_dir: Option<String>,
+    fps: Option<u32>,
+    frame_ticks: u64,
+    started_unix_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecordingSummary {
+    session_id: String,
+    output_dir: String,
+    fps: u32,
+    frame_ticks: u64,
+    duration_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentCursorEvent {
+    x_pt: i32,
+    y_pt: i32,
+    monitor_origin_x_pt: i32,
+    monitor_origin_y_pt: i32,
+    phase: String,
+    unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionReplayRequest {
+    session_id: String,
+    instruction: String,
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionReplayResult {
+    session_id: String,
+    monitor_id: u32,
+    frame_path: String,
+    action: VisionAction,
+    clicked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct VisionActionRaw {
+    action: String,
+    x_norm: f64,
+    y_norm: f64,
+    confidence: f64,
+    reason: String,
+}
+
+fn now_unix_ms() -> Result<u128, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())
+        .map(|d| d.as_millis())
+}
+
+fn recordings_root_dir() -> PathBuf {
+    std::env::temp_dir().join("agenticify-recordings")
+}
+
+fn monitor_by_id(monitor_id: u32) -> Result<Monitor, String> {
+    let monitors = Monitor::all().map_err(|e| e.to_string())?;
+    monitors
+        .into_iter()
+        .find(|m| m.id().ok() == Some(monitor_id))
+        .ok_or_else(|| format!("Monitor {} is not currently available", monitor_id))
+}
+
+fn latest_frame_for_session(session_id: &str) -> Result<(PathBuf, u32), String> {
+    let session_dir = recordings_root_dir().join(session_id);
+    if !session_dir.exists() {
+        return Err(format!("Session '{}' not found", session_id));
+    }
+
+    let mut best: Option<(String, PathBuf, u32)> = None;
+    let monitor_dirs = fs::read_dir(&session_dir).map_err(|e| e.to_string())?;
+    for monitor_entry in monitor_dirs {
+        let monitor_path = monitor_entry.map_err(|e| e.to_string())?.path();
+        if !monitor_path.is_dir() {
+            continue;
+        }
+
+        let dir_name = monitor_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let Some(monitor_id_str) = dir_name.strip_prefix("monitor-") else {
+            continue;
+        };
+        let Ok(monitor_id) = monitor_id_str.parse::<u32>() else {
+            continue;
+        };
+
+        let frames = fs::read_dir(&monitor_path).map_err(|e| e.to_string())?;
+        for frame_entry in frames {
+            let frame_path = frame_entry.map_err(|e| e.to_string())?.path();
+            if !frame_path.is_file() {
+                continue;
+            }
+            if frame_path.extension().and_then(|e| e.to_str()) != Some("png") {
+                continue;
+            }
+
+            let frame_name = frame_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let replace = match &best {
+                Some((best_name, _, _)) => frame_name > *best_name,
+                None => true,
+            };
+            if replace {
+                best = Some((frame_name, frame_path.clone(), monitor_id));
+            }
+        }
+    }
+
+    best
+        .map(|(_, path, monitor_id)| (path, monitor_id))
+        .ok_or_else(|| format!("No frame images found for session '{}'", session_id))
+}
+
+fn confidence_threshold() -> f64 {
+    std::env::var("AGENT_CONFIDENCE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(DEFAULT_CONFIDENCE_THRESHOLD)
+}
+
+fn clamp_norm(v: f64) -> f64 {
+    v.max(0.0).min(1000.0)
+}
+
+fn normalized_to_global_points(req: &ClickRequest) -> (i32, i32) {
+    let x_px =
+        (clamp_norm(req.x_norm) / 1000.0 * (req.screenshot_w_px.saturating_sub(1) as f64)).round();
+    let y_px =
+        (clamp_norm(req.y_norm) / 1000.0 * (req.screenshot_h_px.saturating_sub(1) as f64)).round();
+
+    let x_pt = req.monitor_origin_x_pt as f64 + (x_px / req.scale_factor.max(1.0));
+    let y_pt = req.monitor_origin_y_pt as f64 + (y_px / req.scale_factor.max(1.0));
+
+    (x_pt.round() as i32, y_pt.round() as i32)
+}
+
+fn perform_real_click(
+    app: Option<&tauri::AppHandle>,
+    guards: &RuntimeGuards,
+    req: &ClickRequest,
+) -> Result<(), String> {
+    if guards.estop.load(Ordering::SeqCst) {
+        return Err("Emergency stop active".to_string());
+    }
+
+    if req.confidence < confidence_threshold() {
+        return Err(format!(
+            "Confidence {:.3} below threshold {:.3}",
+            req.confidence,
+            confidence_threshold()
+        ));
+    }
+
+    let n = guards.actions.fetch_add(1, Ordering::SeqCst);
+    if n >= MAX_ACTIONS_PER_RUN {
+        guards.estop.store(true, Ordering::SeqCst);
+        return Err("Max actions reached; E-STOP engaged".to_string());
+    }
+
+    let (x_pt, y_pt) = normalized_to_global_points(req);
+    let started = Instant::now();
+
+    if let Some(app_handle) = app {
+        let _ = app_handle.emit(
+            "agent_cursor_event",
+            AgentCursorEvent {
+                x_pt,
+                y_pt,
+                monitor_origin_x_pt: req.monitor_origin_x_pt,
+                monitor_origin_y_pt: req.monitor_origin_y_pt,
+                phase: "move".to_string(),
+                unix_ms: now_unix_ms().unwrap_or(0),
+            },
+        );
+    }
+
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo
+        .move_mouse(x_pt, y_pt, Coordinate::Abs)
+        .map_err(|e| e.to_string())?;
+    enigo
+        .button(Button::Left, Direction::Click)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(app_handle) = app {
+        let _ = app_handle.emit(
+            "agent_cursor_event",
+            AgentCursorEvent {
+                x_pt,
+                y_pt,
+                monitor_origin_x_pt: req.monitor_origin_x_pt,
+                monitor_origin_y_pt: req.monitor_origin_y_pt,
+                phase: "click".to_string(),
+                unix_ms: now_unix_ms().unwrap_or(0),
+            },
+        );
+    }
+
+    let click_ms = started.elapsed().as_millis();
+    println!(
+        "[telemetry] click_ms={} point=({}, {}) action_count={}",
+        click_ms,
+        x_pt,
+        y_pt,
+        n + 1
+    );
+
+    Ok(())
+}
+
+fn primary_monitor() -> Result<Monitor, String> {
+    let monitors = Monitor::all().map_err(|e| e.to_string())?;
+    monitors
+        .into_iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .ok_or_else(|| "No primary monitor found".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn primary_backing_scale_factor() -> Option<f64> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
+
+    let mtm = MainThreadMarker::new()?;
+    NSScreen::mainScreen(mtm).map(|s| s.backingScaleFactor() as f64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn primary_backing_scale_factor() -> Option<f64> {
+    Some(1.0)
+}
+
+#[cfg(target_os = "macos")]
+fn check_permissions() -> PermissionState {
+    use core_graphics::access::ScreenCaptureAccess;
+    use macos_accessibility_client::accessibility::application_is_trusted;
+
+    PermissionState {
+        screen_recording: ScreenCaptureAccess::default().preflight(),
+        accessibility: application_is_trusted(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_permissions() -> PermissionState {
+    PermissionState {
+        screen_recording: true,
+        accessibility: true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn request_permissions() -> PermissionState {
+    use core_graphics::access::ScreenCaptureAccess;
+    use macos_accessibility_client::accessibility::application_is_trusted_with_prompt;
+
+    let _ = ScreenCaptureAccess::default().request();
+    let _ = application_is_trusted_with_prompt();
+
+    let state = check_permissions();
+
+    if !state.screen_recording {
+        let _ = Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+            .status();
+    }
+
+    if !state.accessibility {
+        let _ = Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .status();
+    }
+
+    state
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_permissions() -> PermissionState {
+    check_permissions()
+}
+
+fn extract_json_payload(text: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        return Ok(trimmed.to_string());
+    }
+
+    if let Some(start) = trimmed.find("```") {
+        let rest = &trimmed[start + 3..];
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        if let Some(end) = rest.find("```") {
+            return Ok(rest[..end].trim().to_string());
+        }
+    }
+
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                return Ok(trimmed[start..=end].to_string());
+            }
+        }
+    }
+
+    Err("Could not extract JSON from model response".to_string())
+}
+
+fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, String> {
+    let json_text = extract_json_payload(content)?;
+    let raw: VisionActionRaw = serde_json::from_str(&json_text).map_err(|e| e.to_string())?;
+
+    let action = raw.action.to_lowercase();
+    if action != "click" && action != "none" {
+        return Err("action must be 'click' or 'none'".to_string());
+    }
+
+    if !(0.0..=1000.0).contains(&raw.x_norm) || !(0.0..=1000.0).contains(&raw.y_norm) {
+        return Err("x_norm and y_norm must be in [0,1000]".to_string());
+    }
+
+    if !(0.0..=1.0).contains(&raw.confidence) {
+        return Err("confidence must be in [0,1]".to_string());
+    }
+
+    Ok(VisionAction {
+        action,
+        x_norm: raw.x_norm,
+        y_norm: raw.y_norm,
+        confidence: raw.confidence,
+        reason: raw.reason,
+        model_ms,
+    })
+}
+
+fn infer_max_dim() -> u32 {
+    std::env::var("AGENT_INFER_MAX_DIM")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(640, 4096))
+        .unwrap_or(DEFAULT_INFER_MAX_DIM)
+}
+
+fn load_infer_image_bytes(path: &str) -> Result<(Vec<u8>, u32, u32, u32, u32), String> {
+    let raw = fs::read(path).map_err(|e| e.to_string())?;
+    let img = image::load_from_memory(&raw).map_err(|e| e.to_string())?;
+    let orig_w = img.width();
+    let orig_h = img.height();
+    let max_dim = infer_max_dim();
+
+    if orig_w.max(orig_h) <= max_dim {
+        return Ok((raw, orig_w, orig_h, orig_w, orig_h));
+    }
+
+    let scale = (max_dim as f64) / (orig_w.max(orig_h) as f64);
+    let new_w = ((orig_w as f64 * scale).round() as u32).max(1);
+    let new_h = ((orig_h as f64 * scale).round() as u32).max(1);
+
+    let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
+    let mut cursor = Cursor::new(Vec::new());
+    resized
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+
+    Ok((cursor.into_inner(), orig_w, orig_h, new_w, new_h))
+}
+
+async fn upload_temp_image(png_bytes: Vec<u8>) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Agenticify/1.0")
+        .build()
+        .map_err(|e| format!("http client error: {}", e))?;
+    let part = reqwest::multipart::Part::bytes(png_bytes)
+        .file_name("screenshot.png")
+        .mime_str("image/png")
+        .map_err(|e| format!("multipart mime error: {}", e))?;
+    let form = reqwest::multipart::Form::new().part("file", part);
+
+    let resp = client
+        .post("https://tmpfiles.org/api/v1/upload")
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("image upload failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("image upload returned {}: {}", status, body));
+    }
+
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("upload parse error: {}", e))?;
+    let page_url = body
+        .get("data")
+        .and_then(|d| d.get("url"))
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| format!("unexpected upload response: {}", body))?;
+
+    // tmpfiles.org returns a page URL like http://tmpfiles.org/12345/screenshot.png
+    // convert to direct download URL: https://tmpfiles.org/dl/12345/screenshot.png
+    let url = page_url
+        .replacen("tmpfiles.org/", "tmpfiles.org/dl/", 1)
+        .replacen("http://", "https://", 1);
+    println!("[provider] uploaded screenshot -> {}", url);
+    Ok(url)
+}
+
+fn resolve_primary_api_base() -> String {
+    std::env::var("OPENROUTER_API_BASE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("MISTRAL_API_BASE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_MISTRAL_BASE.to_string())
+}
+
+fn resolve_primary_api_key() -> String {
+    std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("MISTRAL_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn is_openrouter_base(base: &str) -> bool {
+    base.to_ascii_lowercase().contains("openrouter.ai")
+}
+
+#[tauri::command]
+fn check_permissions_cmd() -> PermissionState {
+    check_permissions()
+}
+
+#[tauri::command]
+fn request_permissions_cmd() -> PermissionState {
+    request_permissions()
+}
+
+#[tauri::command]
+fn env_status_cmd() -> EnvStatus {
+    let key_loaded = !resolve_primary_api_key().trim().is_empty();
+    let base = resolve_primary_api_base();
+
+    EnvStatus {
+        mistral_api_key_loaded: key_loaded,
+        mistral_api_base: base,
+    }
+}
+
+#[tauri::command]
+async fn validate_mistral_api_key_cmd() -> Result<MistralAuthStatus, String> {
+    let base = resolve_primary_api_base();
+    let api_key = resolve_primary_api_key().trim().to_string();
+
+    if api_key.is_empty() {
+        return Ok(MistralAuthStatus {
+            ok: false,
+            http_status: None,
+            message: "Primary API key is missing (set OPENROUTER_API_KEY or MISTRAL_API_KEY)"
+                .to_string(),
+            mistral_api_base: base,
+        });
+    }
+
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = match client.get(&url).bearer_auth(api_key).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            return Ok(MistralAuthStatus {
+                ok: false,
+                http_status: None,
+            message: format!("Network error while contacting API provider: {}", err),
+            mistral_api_base: base,
+        });
+    }
+    };
+
+    let status = resp.status();
+    let code = status.as_u16();
+    if status.is_success() {
+        return Ok(MistralAuthStatus {
+            ok: true,
+            http_status: Some(code),
+            message: "API key validated against provider".to_string(),
+            mistral_api_base: base,
+        });
+    }
+
+    let body = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+    let compact_body = body.chars().take(220).collect::<String>();
+    let message = if status == reqwest::StatusCode::UNAUTHORIZED
+        && is_openrouter_base(&base)
+    {
+        "Unauthorized (401): OPENROUTER_API_KEY is invalid or revoked.".to_string()
+    } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        "Unauthorized (401): MISTRAL_API_KEY is invalid or revoked.".to_string()
+    } else {
+        format!("API error {}: {}", code, compact_body)
+    };
+
+    Ok(MistralAuthStatus {
+        ok: false,
+        http_status: Some(code),
+        message,
+        mistral_api_base: base,
+    })
+}
+
+#[tauri::command]
+fn recordings_root_cmd() -> Result<String, String> {
+    let root = recordings_root_dir();
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    Ok(root.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn list_recording_sessions_cmd() -> Result<Vec<RecordingSummary>, String> {
+    let root = recordings_root_dir();
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+
+        let text = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+        let mut summary: RecordingSummary = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if summary.output_dir.is_empty() {
+            summary.output_dir = path.to_string_lossy().to_string();
+        }
+        sessions.push(summary);
+    }
+
+    sessions.sort_by(|a, b| b.session_id.cmp(&a.session_id));
+    Ok(sessions)
+}
+
+#[tauri::command]
+fn open_path_cmd(path: String) -> Result<(), String> {
+    let p = PathBuf::from(path);
+    if !p.exists() {
+        return Err("Path does not exist".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&p)
+            .status()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(&p)
+            .status()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&p)
+            .status()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Unsupported OS for open_path_cmd".to_string())
+}
+
+#[tauri::command]
+fn recording_status_cmd(recording: State<RecordingState>) -> RecordingStatus {
+    match recording.active.lock() {
+        Ok(guard) => {
+            if let Some(active) = guard.as_ref() {
+                RecordingStatus {
+                    active: true,
+                    session_id: Some(active.session_id.clone()),
+                    output_dir: Some(active.output_dir.to_string_lossy().to_string()),
+                    fps: Some(active.fps),
+                    frame_ticks: active.frame_ticks.load(Ordering::SeqCst),
+                    started_unix_ms: Some(active.started_unix_ms),
+                }
+            } else {
+                RecordingStatus {
+                    active: false,
+                    session_id: None,
+                    output_dir: None,
+                    fps: None,
+                    frame_ticks: 0,
+                    started_unix_ms: None,
+                }
+            }
+        }
+        Err(_) => RecordingStatus {
+            active: false,
+            session_id: None,
+            output_dir: None,
+            fps: None,
+            frame_ticks: 0,
+            started_unix_ms: None,
+        },
+    }
+}
+
+#[tauri::command]
+fn start_recording_session_cmd(
+    recording: State<RecordingState>,
+    fps: Option<u32>,
+) -> Result<RecordingStatus, String> {
+    let mut guard = recording
+        .active
+        .lock()
+        .map_err(|_| "Recording lock poisoned".to_string())?;
+
+    if guard.is_some() {
+        return Err("A recording session is already active".to_string());
+    }
+
+    let session_fps = fps.unwrap_or(2).clamp(1, 8);
+    let started_unix_ms = now_unix_ms()?;
+    let session_id = format!("session-{}", started_unix_ms);
+    let output_dir = std::env::temp_dir()
+        .join("agenticify-recordings")
+        .join(&session_id);
+    fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let frame_ticks = Arc::new(AtomicU64::new(0));
+
+    let stop_flag_worker = Arc::clone(&stop_flag);
+    let frame_ticks_worker = Arc::clone(&frame_ticks);
+    let output_dir_worker = output_dir.clone();
+
+    let worker = thread::spawn(move || {
+        let frame_interval = Duration::from_millis((1000 / session_fps.max(1)) as u64);
+
+        while !stop_flag_worker.load(Ordering::SeqCst) {
+            let tick_started = Instant::now();
+            let tick = frame_ticks_worker.fetch_add(1, Ordering::SeqCst) + 1;
+
+            match Monitor::all() {
+                Ok(monitors) => {
+                    for monitor in monitors {
+                        let monitor_id = match monitor.id() {
+                            Ok(id) => id,
+                            Err(err) => {
+                                eprintln!("[recording] monitor id error: {}", err);
+                                continue;
+                            }
+                        };
+
+                        let image = match monitor.capture_image() {
+                            Ok(img) => img,
+                            Err(err) => {
+                                eprintln!(
+                                    "[recording] capture monitor {} error: {}",
+                                    monitor_id, err
+                                );
+                                continue;
+                            }
+                        };
+
+                        let monitor_dir = output_dir_worker.join(format!("monitor-{}", monitor_id));
+                        if let Err(err) = fs::create_dir_all(&monitor_dir) {
+                            eprintln!("[recording] create dir error: {}", err);
+                            continue;
+                        }
+
+                        let frame_file = monitor_dir.join(format!("frame-{:06}.png", tick));
+                        if let Err(err) = image.save(&frame_file) {
+                            eprintln!("[recording] frame write error: {}", err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[recording] monitor discovery error: {}", err);
+                }
+            }
+
+            let elapsed = tick_started.elapsed();
+            if elapsed < frame_interval {
+                thread::sleep(frame_interval - elapsed);
+            }
+        }
+    });
+
+    *guard = Some(ActiveRecording {
+        session_id,
+        output_dir,
+        fps: session_fps,
+        started_unix_ms,
+        stop_flag,
+        frame_ticks,
+        worker: Some(worker),
+    });
+
+    if let Some(active) = guard.as_ref() {
+        Ok(RecordingStatus {
+            active: true,
+            session_id: Some(active.session_id.clone()),
+            output_dir: Some(active.output_dir.to_string_lossy().to_string()),
+            fps: Some(active.fps),
+            frame_ticks: active.frame_ticks.load(Ordering::SeqCst),
+            started_unix_ms: Some(active.started_unix_ms),
+        })
+    } else {
+        Err("Recording state unavailable after startup".to_string())
+    }
+}
+
+#[tauri::command]
+fn stop_recording_session_cmd(
+    recording: State<RecordingState>,
+) -> Result<RecordingSummary, String> {
+    let mut guard = recording
+        .active
+        .lock()
+        .map_err(|_| "Recording lock poisoned".to_string())?;
+
+    let mut active = guard
+        .take()
+        .ok_or_else(|| "No active recording session".to_string())?;
+
+    active.stop_flag.store(true, Ordering::SeqCst);
+    if let Some(worker) = active.worker.take() {
+        worker
+            .join()
+            .map_err(|_| "Recording worker thread join failed".to_string())?;
+    }
+
+    let finished_unix_ms = now_unix_ms()?;
+    let summary = RecordingSummary {
+        session_id: active.session_id.clone(),
+        output_dir: active.output_dir.to_string_lossy().to_string(),
+        fps: active.fps,
+        frame_ticks: active.frame_ticks.load(Ordering::SeqCst),
+        duration_ms: finished_unix_ms.saturating_sub(active.started_unix_ms),
+    };
+
+    let manifest = json!({
+        "session_id": summary.session_id,
+        "output_dir": summary.output_dir,
+        "fps": summary.fps,
+        "frame_ticks": summary.frame_ticks,
+        "duration_ms": summary.duration_ms
+    });
+
+    let manifest_path = active.output_dir.join("manifest.json");
+    fs::write(&manifest_path, manifest.to_string()).map_err(|e| e.to_string())?;
+
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn replay_recording_session_cmd(
+    app: tauri::AppHandle,
+    guards: State<'_, RuntimeGuards>,
+    req: SessionReplayRequest,
+) -> Result<SessionReplayResult, String> {
+    let (frame_path, monitor_id) = latest_frame_for_session(&req.session_id)?;
+
+    let action = infer_click_cmd(InferClickRequest {
+        png_path: frame_path.to_string_lossy().to_string(),
+        instruction: req.instruction,
+        model: req.model,
+    })
+    .await?;
+
+    let mut clicked = false;
+    if action.action == "click" {
+        let monitor = monitor_by_id(monitor_id)?;
+        let scale_factor = monitor.scale_factor().map_err(|e| e.to_string())? as f64;
+        let width_px = ((monitor.width().map_err(|e| e.to_string())? as f64) * scale_factor).round() as u32;
+        let height_px = ((monitor.height().map_err(|e| e.to_string())? as f64) * scale_factor).round() as u32;
+
+        let req_click = ClickRequest {
+                x_norm: action.x_norm,
+                y_norm: action.y_norm,
+                screenshot_w_px: width_px,
+                screenshot_h_px: height_px,
+                monitor_origin_x_pt: monitor.x().map_err(|e| e.to_string())?,
+                monitor_origin_y_pt: monitor.y().map_err(|e| e.to_string())?,
+                scale_factor,
+                confidence: action.confidence,
+            };
+        perform_real_click(Some(&app), &guards, &req_click)?;
+        clicked = true;
+    }
+
+    Ok(SessionReplayResult {
+        session_id: req.session_id,
+        monitor_id,
+        frame_path: frame_path.to_string_lossy().to_string(),
+        action,
+        clicked,
+    })
+}
+
+#[tauri::command]
+fn get_runtime_state_cmd(guards: State<RuntimeGuards>) -> RuntimeState {
+    RuntimeState {
+        estop: guards.estop.load(Ordering::SeqCst),
+        actions: guards.actions.load(Ordering::SeqCst),
+        max_actions: MAX_ACTIONS_PER_RUN,
+    }
+}
+
+#[tauri::command]
+fn set_estop_cmd(guards: State<RuntimeGuards>, enabled: bool) -> RuntimeState {
+    guards.estop.store(enabled, Ordering::SeqCst);
+    if !enabled {
+        guards.actions.store(0, Ordering::SeqCst);
+    }
+
+    get_runtime_state_cmd(guards)
+}
+
+#[tauri::command]
+fn capture_primary_cmd(display_state: State<DisplayState>) -> Result<CaptureFrame, String> {
+    let started = Instant::now();
+    let monitor = primary_monitor()?;
+
+    let monitor_id = monitor.id().map_err(|e| e.to_string())?;
+    let monitor_origin_x_pt = monitor.x().map_err(|e| e.to_string())?;
+    let monitor_origin_y_pt = monitor.y().map_err(|e| e.to_string())?;
+    let screenshot = monitor.capture_image().map_err(|e| e.to_string())?;
+
+    let screenshot_w_px = screenshot.width();
+    let screenshot_h_px = screenshot.height();
+
+    let startup_scale = *display_state
+        .primary_scale_factor
+        .read()
+        .map_err(|_| "Display scale lock poisoned".to_string())?;
+
+    let xcap_scale = monitor.scale_factor().map_err(|e| e.to_string())? as f64;
+    let scale_factor = if startup_scale > 0.0 {
+        startup_scale
+    } else if xcap_scale > 0.0 {
+        xcap_scale
+    } else {
+        1.0
+    };
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    let file_name = format!("agenticify-primary-{}-{}.png", monitor_id, ts);
+    let png_path: PathBuf = std::env::temp_dir().join(file_name);
+    screenshot.save(&png_path).map_err(|e| e.to_string())?;
+
+    let capture_ms = started.elapsed().as_millis();
+    println!(
+        "[telemetry] capture_ms={} monitor_id={} size={}x{} scale={}",
+        capture_ms, monitor_id, screenshot_w_px, screenshot_h_px, scale_factor
+    );
+
+    Ok(CaptureFrame {
+        monitor_id,
+        monitor_origin_x_pt,
+        monitor_origin_y_pt,
+        screenshot_w_px,
+        screenshot_h_px,
+        scale_factor,
+        png_path: png_path.to_string_lossy().to_string(),
+        capture_ms,
+    })
+}
+
+#[tauri::command]
+async fn infer_click_cmd(req: InferClickRequest) -> Result<VisionAction, String> {
+    use openrouter_rs::{
+        OpenRouterClient,
+        api::chat::{ChatCompletionRequest, Message, Content, ContentPart},
+        types::Role,
+    };
+
+    let started = Instant::now();
+    let (image_bytes, orig_w, orig_h, sent_w, sent_h) = load_infer_image_bytes(&req.png_path)?;
+    let image_url = upload_temp_image(image_bytes).await?;
+    if (orig_w, orig_h) != (sent_w, sent_h) {
+        println!(
+            "[telemetry] infer_image downscaled {}x{} -> {}x{} (max_dim={})",
+            orig_w, orig_h, sent_w, sent_h, infer_max_dim()
+        );
+    } else {
+        println!(
+            "[telemetry] infer_image using original {}x{} (max_dim={})",
+            orig_w, orig_h, infer_max_dim()
+        );
+    }
+
+    let system_prompt = "You are a desktop UI grounding model. Return only valid JSON matching this schema: {\"action\":\"click\"|\"none\", \"x_norm\":0-1000, \"y_norm\":0-1000, \"confidence\":0-1, \"reason\":\"...\"}. If the target is not visible, set action='none', confidence<=0.3, x_norm=0, y_norm=0.";
+
+    let user_prompt = format!(
+        "Task: {}\nCoordinate space: normalized [0,1000] over the provided screenshot.\nThe image may be resized for transport but keeps the same full scene and aspect ratio (no crop).\nCoordinates must be resolution-independent normalized values.\nReturn the best click target.",
+        req.instruction
+    );
+
+    let api_key = resolve_primary_api_key();
+    if api_key.trim().is_empty() {
+        return Err("API key is missing. Set OPENROUTER_API_KEY (or MISTRAL_API_KEY).".to_string());
+    }
+
+    let model = req
+        .model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(DEFAULT_MISTRAL_MODEL)
+        .to_string();
+
+    let client = OpenRouterClient::builder()
+        .api_key(api_key.trim())
+        .http_referer("https://agenticify.local")
+        .x_title("Agenticify")
+        .build()
+        .map_err(|e| format!("OpenRouter client error: {}", e))?;
+
+    println!("[provider] using openrouter model={}", model);
+
+    let request = ChatCompletionRequest::builder()
+        .model(&model)
+        .messages(vec![
+            Message::new(Role::System, system_prompt),
+            Message::new(
+                Role::User,
+                Content::Parts(vec![
+                    ContentPart::text(&user_prompt),
+                    ContentPart::image_url(&image_url),
+                ]),
+            ),
+        ])
+        .temperature(0.0)
+        .build()
+        .map_err(|e| format!("Request build error: {}", e))?;
+
+    let response = client
+        .send_chat_completion(&request)
+        .await
+        .map_err(|e| format!("OpenRouter API error: {}", e))?;
+
+    let content = response.choices.first()
+        .and_then(|c| c.content())
+        .ok_or_else(|| "No content in response choices".to_string())?
+        .to_string();
+
+    let model_ms = started.elapsed().as_millis();
+    let parsed = parse_vision_action(&content, model_ms)?;
+
+    println!(
+        "[telemetry] model_ms={} action={} confidence={:.3} provider=openrouter",
+        model_ms, parsed.action, parsed.confidence
+    );
+
+    Ok(parsed)
+}
+
+#[tauri::command]
+fn execute_real_click_cmd(
+    app: tauri::AppHandle,
+    guards: State<RuntimeGuards>,
+    req: ClickRequest,
+) -> Result<(), String> {
+    perform_real_click(Some(&app), &guards, &req)
+}
+
+fn init_display_scale(display_state: &DisplayState) {
+    let from_nsscreen = primary_backing_scale_factor().unwrap_or(0.0);
+    let from_xcap = primary_monitor()
+        .ok()
+        .and_then(|m| m.scale_factor().ok())
+        .map(|v| v as f64)
+        .unwrap_or(0.0);
+
+    let resolved = if from_nsscreen > 0.0 {
+        from_nsscreen
+    } else if from_xcap > 0.0 {
+        from_xcap
+    } else {
+        1.0
+    };
+
+    if let Ok(mut lock) = display_state.primary_scale_factor.write() {
+        *lock = resolved;
+    }
+
+    println!(
+        "[startup] primary scale factor resolved: nsscreen={} xcap={} final={}",
+        from_nsscreen, from_xcap, resolved
+    );
+}
+
+fn main() {
+    if let Err(err) = dotenvy::dotenv() {
+        println!(
+            "[startup] dotenv not loaded (this is okay if env vars are exported): {}",
+            err
+        );
+    } else {
+        println!("[startup] loaded environment from .env");
+    }
+
+    tauri::Builder::default()
+        .manage(RuntimeGuards::default())
+        .manage(DisplayState::default())
+        .manage(RecordingState::default())
+        .setup(|app| {
+            let display_state = app.state::<DisplayState>();
+            init_display_scale(&display_state);
+
+            #[cfg(target_os = "macos")]
+            {
+                let state = check_permissions();
+                if !state.screen_recording || !state.accessibility {
+                    let _ = request_permissions();
+                }
+            }
+
+            app.handle().plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_shortcuts(["cmd+shift+escape", "cmd+shift+enter"])?
+                    .with_handler(|app_handle, shortcut, event| {
+                        if event.state == ShortcutState::Pressed
+                            && shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::Escape)
+                        {
+                            let guards = app_handle.state::<RuntimeGuards>();
+                            guards.estop.store(true, Ordering::SeqCst);
+                            println!("[safety] global E-STOP activated via Cmd+Shift+Esc");
+                            return;
+                        }
+
+                        if event.state == ShortcutState::Pressed
+                            && shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::Enter)
+                        {
+                            if let Some(main) = app_handle.get_webview_window("main") {
+                                let _ = main.show();
+                                let _ = main.unminimize();
+                                let _ = main.set_focus();
+                                println!("[window] restored main window via Cmd+Shift+Enter");
+                            } else {
+                                println!("[window] could not restore main window (label=main not found)");
+                            }
+                        }
+                    })
+                    .build(),
+            )?;
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            check_permissions_cmd,
+            request_permissions_cmd,
+            env_status_cmd,
+            validate_mistral_api_key_cmd,
+            recordings_root_cmd,
+            list_recording_sessions_cmd,
+            open_path_cmd,
+            recording_status_cmd,
+            start_recording_session_cmd,
+            stop_recording_session_cmd,
+            replay_recording_session_cmd,
+            get_runtime_state_cmd,
+            set_estop_cmd,
+            capture_primary_cmd,
+            infer_click_cmd,
+            execute_real_click_cmd,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalized_to_global_points, ClickRequest};
+
+    #[test]
+    fn maps_normalized_to_points_with_scale() {
+        let req = ClickRequest {
+            x_norm: 500.0,
+            y_norm: 500.0,
+            screenshot_w_px: 3000,
+            screenshot_h_px: 2000,
+            monitor_origin_x_pt: 0,
+            monitor_origin_y_pt: 0,
+            scale_factor: 2.0,
+            confidence: 1.0,
+        };
+
+        let (x, y) = normalized_to_global_points(&req);
+        assert!((x - 750).abs() <= 1);
+        assert!((y - 500).abs() <= 1);
+    }
+}
