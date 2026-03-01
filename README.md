@@ -11,7 +11,7 @@ Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on m
 ### Vision-First Agent Loop
 
 - Captures the screen, sends it to a vision model (OpenRouter / Mistral), and executes the model's decision — all in a tight loop.
-- Supports **click**, **hotkey**, **type**, and **none** (task complete) actions.
+- Supports **click**, **hotkey**, **type**, **shell** (CLI commands), and **none** (task complete) actions.
 - Step history is passed between iterations so the agent remembers what it already did.
 - Configurable confidence threshold — low-confidence actions are rejected automatically.
 
@@ -65,6 +65,16 @@ Record yourself performing a task — the AI watches, learns, and can repeat it.
 - **Max action cap** (30 per run) with auto-stop.
 - Per-action confidence threshold gating.
 
+### Shell Commands + WhiteCircle Guardrails
+
+- The agent can run CLI commands via `/bin/sh -c` when a task is better handled through the terminal (file ops, git, installs, scripts).
+- **WhiteCircle integration** — every shell command is validated through WhiteCircle's guardrail API before execution:
+  - **Input guard**: blocks unsafe/malicious commands before they run.
+  - **Output guard**: screens command output for sensitive data leaks.
+- **Strict mode** (`WHITECIRCLE_STRICT=true`): hard-blocks commands when the guardrail API is unreachable.
+- **Graceful degradation**: without an API key, commands execute with a logged warning.
+- 10-second timeout per command, 4KB output cap to protect model context.
+
 ---
 
 ## Architecture
@@ -83,7 +93,11 @@ flowchart TD
         EXEC -->|click| MOUSE[enigo Mouse]
         EXEC -->|hotkey| KEYS[enigo Keyboard]
         EXEC -->|type| TYPE[enigo Text Input]
+        EXEC -->|shell| SHELL["Shell Command"]
         EXEC -->|none| DONE[Task Complete]
+        SHELL --> WC{WhiteCircle Guard}
+        WC -->|allowed| RUN[Execute + Capture Output]
+        WC -->|blocked| REJECT[Reject Command]
         RDEV[rdev Input Listener] --> EVENTS[Input Events]
     end
 
@@ -147,6 +161,7 @@ All status indicators use clean health-card style — no raw JSON dumps.
 | Input Event Capture      | `rdev` (global mouse/keyboard listener)   |
 | Vision Model             | OpenRouter API (Mistral, configurable)    |
 | HTTP Client              | `reqwest` + `openrouter-rs`               |
+| AI Guardrails            | WhiteCircle API (input/output protection) |
 | Styling                  | Vanilla CSS with glassmorphism, dark mode |
 
 ## Environment
@@ -158,6 +173,11 @@ OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
 OPENROUTER_API_BASE=https://openrouter.ai/api/v1
 AGENT_CONFIDENCE_THRESHOLD=0.60
 AGENT_INFER_MAX_DIM=960
+
+# WhiteCircle Guardrails (for shell command safety)
+WHITECIRCLE_API_KEY=YOUR_WHITECIRCLE_KEY
+WHITECIRCLE_API_BASE=https://eu.whitecircle.ai/api/v1
+WHITECIRCLE_STRICT=true
 ```
 
 ## Run
@@ -180,6 +200,7 @@ Requires macOS with **Screen Recording** and **Accessibility** permissions (prom
 | `execute_real_click_cmd` | Perform mouse click at normalized coordinates |
 | `press_keys_cmd`         | Execute keyboard shortcuts                    |
 | `type_text_cmd`          | Type text string                              |
+| `run_shell_cmd`          | Execute shell command with WhiteCircle guard  |
 
 ### Sessions (recording.rs)
 

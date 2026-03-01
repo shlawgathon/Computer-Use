@@ -401,6 +401,42 @@ code {
   background: transparent;
 }
 
+/* ── Agent Active Glow Border ───────────────── */
+
+.agent-glow-border {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  border: 2px solid rgba(60, 140, 255, 0.6);
+  border-radius: 0;
+  box-shadow:
+    inset 0 0 30px rgba(60, 140, 255, 0.25),
+    inset 0 0 60px rgba(60, 140, 255, 0.12),
+    0 0 20px rgba(60, 140, 255, 0.3),
+    0 0 50px rgba(60, 140, 255, 0.15);
+  animation: glow-pulse 2s ease-in-out infinite;
+}
+
+@keyframes glow-pulse {
+  0%, 100% {
+    border-color: rgba(60, 140, 255, 0.6);
+    box-shadow:
+      inset 0 0 30px rgba(60, 140, 255, 0.25),
+      inset 0 0 60px rgba(60, 140, 255, 0.12),
+      0 0 20px rgba(60, 140, 255, 0.3),
+      0 0 50px rgba(60, 140, 255, 0.15);
+  }
+  50% {
+    border-color: rgba(90, 176, 255, 0.85);
+    box-shadow:
+      inset 0 0 40px rgba(90, 176, 255, 0.35),
+      inset 0 0 80px rgba(90, 176, 255, 0.18),
+      0 0 30px rgba(90, 176, 255, 0.45),
+      0 0 70px rgba(90, 176, 255, 0.2);
+  }
+}
+
 .hud-root {
   position: fixed;
   inset: 0;
@@ -786,6 +822,10 @@ code {
 .phase-tag.click {
   background: rgba(90, 176, 255, 0.22);
   color: #8ed6ff;
+}
+.phase-tag.shell {
+  background: rgba(255, 160, 50, 0.22);
+  color: #ffcc80;
 }
 
 /* ── HUD Command Input ───────────────────── */

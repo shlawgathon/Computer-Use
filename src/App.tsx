@@ -53,7 +53,7 @@ type KeyAction = {
 };
 
 type VisionAction = {
-  action: "click" | "hotkey" | "type" | "none";
+  action: "click" | "hotkey" | "type" | "shell" | "none";
   x_norm: number;
   y_norm: number;
   confidence: number;
@@ -61,6 +61,8 @@ type VisionAction = {
   model_ms: number;
   keys?: KeyAction[];
   text?: string;
+  command?: string;
+  shell_output?: string;
 };
 
 type RecordingStatus = {
@@ -328,6 +330,7 @@ function OverlayWindow() {
     y: number;
     phase: string;
   }>({ visible: false, x: 0, y: 0, phase: "move" });
+  const [agentActive, setAgentActive] = useState(false);
 
   useLayoutEffect(() => {
     document.documentElement.classList.add("overlay-window");
@@ -399,8 +402,40 @@ function OverlayWindow() {
     };
   }, []);
 
+  // Listen for agent_step events to show/hide the glow border
+  useEffect(() => {
+    let glowTimeout: number | undefined;
+    let unlisten: (() => void) | undefined;
+
+    void (async () => {
+      unlisten = await listen<AgentStep>("agent_step", ({ payload }) => {
+        if (glowTimeout) window.clearTimeout(glowTimeout);
+
+        if (payload.phase === "done" || payload.phase === "error") {
+          // Fade out after 2s
+          glowTimeout = window.setTimeout(() => setAgentActive(false), 2000);
+        } else {
+          void (async () => {
+            const w = getCurrentWindow();
+            await w.show().catch(() => undefined);
+            await w.setAlwaysOnTop(true).catch(() => undefined);
+            await w.setIgnoreCursorEvents(true).catch(() => undefined);
+            await w.setFocusable(false).catch(() => undefined);
+          })();
+          setAgentActive(true);
+        }
+      });
+    })();
+
+    return () => {
+      if (glowTimeout) window.clearTimeout(glowTimeout);
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   return (
     <main className="overlay-root">
+      {agentActive && <div className="agent-glow-border" />}
       {cursor.visible ? (
         <div
           className={`agent-cursor ${cursor.phase === "click" ? "click" : "move"}`}
@@ -551,6 +586,8 @@ function HudWindow() {
         });
       } else if (inferred.action === "type" && inferred.text) {
         await invoke("type_text_cmd", { text: inferred.text });
+      } else if (inferred.action === "shell" && inferred.command) {
+        await invoke<string>("run_shell_cmd", { command: inferred.command });
       } else {
         return;
       }
@@ -601,6 +638,10 @@ function HudWindow() {
           await invoke("press_keys_cmd", {
             req: { keys: inferred.keys, delay_ms: 30 },
           });
+        } else if (inferred.action === "type" && inferred.text) {
+          await invoke("type_text_cmd", { text: inferred.text });
+        } else if (inferred.action === "shell" && inferred.command) {
+          await invoke<string>("run_shell_cmd", { command: inferred.command });
         }
 
         // Brief pause between steps to let the UI settle
@@ -695,13 +736,19 @@ function HudWindow() {
   };
 
   useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     void (async () => {
       unlisten = await listen<AgentStep>("agent_step", ({ payload }) => {
+        if (cancelled) return;
         pushActivity(payload);
+        // Auto-open activity panel when agent starts running
+        if (payload.phase !== "done" && payload.phase !== "error") {
+          setHudPanel((p) => p === "none" ? "activity" : p);
+        }
       });
     })();
-    return () => { if (unlisten) unlisten(); };
+    return () => { cancelled = true; if (unlisten) unlisten(); };
   }, []);
 
   useEffect(() => {
@@ -830,6 +877,9 @@ function HudWindow() {
           } else if (inferred.action === "type" && inferred.text) {
             await invoke("type_text_cmd", { text: inferred.text });
             stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
+          } else if (inferred.action === "shell" && inferred.command) {
+            const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
+            stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
           }
           const s: AgentStep = { phase: inferred.action as AgentStep["phase"], step, max_steps: MAX_STEPS, message: inferred.reason };
           await emit("agent_step", s).catch(() => undefined);
@@ -921,6 +971,11 @@ function HudWindow() {
           await invoke("type_text_cmd", { text: inferred.text });
           stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
           const s: AgentStep = { phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` };
+          await emit("agent_step", s).catch(() => undefined);
+        } else if (inferred.action === "shell" && inferred.command) {
+          const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
+          stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
+          const s: AgentStep = { phase: "shell", step, max_steps: MAX_STEPS, message: `\`${inferred.command}\` — ${inferred.reason}` };
           await emit("agent_step", s).catch(() => undefined);
         }
 
@@ -1714,6 +1769,9 @@ function MainApp() {
       } else if (vision.action === "type" && vision.text) {
         await invoke("type_text_cmd", { text: vision.text });
         pushLog(`typed: "${vision.text}"`);
+      } else if (vision.action === "shell" && vision.command) {
+        const shellOut = await invoke<string>("run_shell_cmd", { command: vision.command });
+        pushLog(`shell: \`${vision.command}\` → ${shellOut.slice(0, 100)}`);
       } else {
         pushLog("action blocked: no actionable result");
         return;
@@ -1766,6 +1824,12 @@ function MainApp() {
           req: { keys: inferred.keys, delay_ms: 30 },
         });
         pushLog(`one-shot hotkey executed: ${inferred.keys.map((k) => k.key).join("+")}`);
+      } else if (inferred.action === "type" && inferred.text) {
+        await invoke("type_text_cmd", { text: inferred.text });
+        pushLog(`one-shot typed: "${inferred.text}"`);
+      } else if (inferred.action === "shell" && inferred.command) {
+        const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
+        pushLog(`one-shot shell: \`${inferred.command}\` → ${shellOut.slice(0, 100)}`);
       } else {
         pushLog("one-shot stopped: model returned no actionable result");
         return;
@@ -1860,6 +1924,12 @@ function MainApp() {
             stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
             pushLog(`  step ${step} typed: "${inferred.text}"`);
             const s: AgentStep = { phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` };
+            pushModelActivity(s); await emit("agent_step", s).catch(() => undefined);
+          } else if (inferred.action === "shell" && inferred.command) {
+            const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
+            stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
+            pushLog(`  step ${step} shell: \`${inferred.command}\``);
+            const s: AgentStep = { phase: "shell", step, max_steps: MAX_STEPS, message: `\`${inferred.command}\` — ${inferred.reason}` };
             pushModelActivity(s); await emit("agent_step", s).catch(() => undefined);
           }
 
@@ -2037,6 +2107,10 @@ function MainApp() {
           await invoke("type_text_cmd", { text: inferred.text });
           stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
           pushModelActivity({ phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` });
+        } else if (inferred.action === "shell" && inferred.command) {
+          const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
+          stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
+          pushModelActivity({ phase: "shell", step, max_steps: MAX_STEPS, message: `\`${inferred.command}\` — ${inferred.reason}` });
         }
 
         setVision(inferred);

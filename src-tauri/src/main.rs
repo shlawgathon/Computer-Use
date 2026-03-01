@@ -106,6 +106,10 @@ struct VisionAction {
     keys: Option<Vec<KeyAction>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shell_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +206,8 @@ struct VisionActionRaw {
     keys: Option<Vec<KeyAction>>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -490,8 +496,8 @@ fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, St
     let raw: VisionActionRaw = serde_json::from_str(&json_text).map_err(|e| e.to_string())?;
 
     let action = raw.action.to_lowercase();
-    if action != "click" && action != "none" && action != "hotkey" && action != "type" {
-        return Err("action must be 'click', 'hotkey', 'type', or 'none'".to_string());
+    if action != "click" && action != "none" && action != "hotkey" && action != "type" && action != "shell" {
+        return Err("action must be 'click', 'hotkey', 'type', 'shell', or 'none'".to_string());
     }
 
     if action == "click" {
@@ -518,6 +524,13 @@ fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, St
         }
     }
 
+    if action == "shell" {
+        match &raw.command {
+            Some(c) if !c.is_empty() => {}
+            _ => return Err("shell action requires a non-empty 'command' field".to_string()),
+        }
+    }
+
     if !(0.0..=1.0).contains(&raw.confidence) {
         return Err("confidence must be in [0,1]".to_string());
     }
@@ -531,6 +544,8 @@ fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, St
         model_ms,
         keys: raw.keys,
         text: raw.text,
+        command: raw.command,
+        shell_output: None,
     })
 }
 
@@ -1126,13 +1141,22 @@ ACTIONS (return exactly one as JSON):\n\n\
    {\"action\":\"hotkey\", \"keys\":[{\"key\":\"Meta\",\"direction\":\"press\"},{\"key\":\"Space\",\"direction\":\"click\"},{\"key\":\"Meta\",\"direction\":\"release\"}], \"confidence\":0-1, \"reason\":\"...\"}\n\n\
 3. TYPE text into the currently focused field:\n\
    {\"action\":\"type\", \"text\":\"Chrome\", \"confidence\":0-1, \"reason\":\"...\"}\n\n\
-4. DONE (goal achieved or truly impossible):\n\
+4. SHELL (run a CLI command and get the output — use for file operations, git, installs, scripts, system info):\n\
+   {\"action\":\"shell\", \"command\":\"ls -la ~/Desktop\", \"confidence\":0-1, \"reason\":\"...\"}\n\
+   Shell output is returned to you in the next step's context. Use this when the task involves terminal commands, file manipulation, or anything faster via CLI than clicking through UI.\n\n\
+5. DONE (goal achieved or truly impossible):\n\
    {\"action\":\"none\", \"x_norm\":0, \"y_norm\":0, \"confidence\":0, \"reason\":\"...\"}\n\n\
 NAVIGATION STRATEGY - To open/switch to an app:\n\
   Step 1: hotkey Cmd+Space (opens Spotlight)\n\
   Step 2: type the app name (e.g. Chrome)\n\
   Step 3: hotkey Return (launches it)\n\
   This is MORE RELIABLE than Cmd+Tab.\n\n\
+SHELL VS GUI — Choose shell when:\n\
+  - The task involves files, directories, git, package managers, or scripts\n\
+  - Checking system info (disk space, processes, environment variables)\n\
+  - Running build/test commands\n\
+  - Installing or configuring software\n\
+  Use GUI actions (click/hotkey/type) for visual tasks that require interacting with app UIs.\n\n\
 GOAL RECOGNITION (CRITICAL - read carefully):\n\
 - After performing actions, LOOK at the ENTIRE screenshot to verify your progress\n\
 - DO NOT confuse random text fields, input boxes, or form fields that happen to contain a URL with the browser address bar\n\
@@ -1143,7 +1167,22 @@ GOAL RECOGNITION (CRITICAL - read carefully):\n\
 - Only return action=none when the ENTIRE goal is VISUALLY CONFIRMED complete on screen\n\n\
 Available keys: Meta/Cmd, Tab, Space, Return/Enter, Escape, Shift, Control/Ctrl, Alt/Option, Up, Down, Left, Right, Backspace, Delete, Home, End, PageUp, PageDown, F1-F12, or any single character.\n\
 Directions: press (hold), release (let go), click (tap, default).\n\
-Common shortcuts: Cmd+T (new tab), Cmd+W (close tab), Cmd+L (address bar), Cmd+N (new window).\n\
+KEYBOARD SHORTCUTS (PREFER these over clicking menus/buttons — faster and more reliable!):\n\
+Browser (Chrome/Safari/Arc):\n\
+  Cmd+T new tab | Cmd+W close tab | Cmd+L focus address bar | Cmd+N new window\n\
+  Cmd+Shift+T reopen closed tab | Cmd+R reload | Cmd+Shift+R hard reload\n\
+  Cmd+[ back | Cmd+] forward | Cmd+1-9 switch to tab N | Ctrl+Tab next tab\n\
+  Cmd+F find on page | Cmd+Shift+N incognito/private | Cmd+, preferences\n\
+  Cmd+D bookmark | Cmd+Shift+J downloads | Cmd+Y history\n\
+macOS System:\n\
+  Cmd+Space Spotlight | Cmd+Tab switch app | Cmd+Q quit app | Cmd+H hide\n\
+  Cmd+M minimize | Cmd+A select all | Cmd+C copy | Cmd+V paste | Cmd+X cut\n\
+  Cmd+Z undo | Cmd+Shift+Z redo | Cmd+S save | Cmd+P print\n\
+  Cmd+Shift+3 screenshot full | Cmd+Shift+4 area | Cmd+Shift+5 tool\n\
+  Ctrl+Cmd+F fullscreen toggle | Cmd+Option+Esc force quit\n\
+Finder: Cmd+Shift+G go to path | Cmd+Shift+. show hidden | Cmd+Delete trash\n\
+Terminal: Ctrl+C interrupt | Ctrl+A start of line | Ctrl+E end of line\n\
+ALWAYS prefer hotkeys over clicking UI when a shortcut exists.\n\
 Return ONLY valid JSON.";
 
     let mut user_prompt = format!(
@@ -1314,6 +1353,186 @@ fn type_text_cmd(guards: State<RuntimeGuards>, text: String) -> Result<(), Strin
     Ok(())
 }
 
+// ── WhiteCircle Guardrail ──────────────────────────────────────────────────────
+
+const MAX_SHELL_OUTPUT_BYTES: usize = 4096;
+const SHELL_TIMEOUT_SECS: u64 = 10;
+
+/// Check a string (command or output) through WhiteCircle's guardrail API.
+/// Returns Ok(true) if safe / no key configured, Ok(false) if blocked.
+async fn whitecircle_guard(input: &str, guard_type: &str) -> Result<bool, String> {
+    let api_key = std::env::var("WHITECIRCLE_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
+    let api_key = match api_key {
+        Some(k) => k,
+        None => {
+            println!("[whitecircle] no API key configured, skipping {} guard", guard_type);
+            return Ok(true); // pass-through when not configured
+        }
+    };
+
+    let base = std::env::var("WHITECIRCLE_API_BASE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://eu.whitecircle.ai/api/v1".to_string());
+
+    let strict = std::env::var("WHITECIRCLE_STRICT")
+        .ok()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let url = format!("{}/guard", base.trim_end_matches('/'));
+
+    let payload = json!({
+        "type": guard_type,
+        "content": input,
+        "source": "agenticify-shell"
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("whitecircle client error: {}", e))?;
+
+    match client
+        .post(&url)
+        .bearer_auth(api_key.trim())
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                let body: serde_json::Value = resp.json().await.unwrap_or(json!({}));
+                let allowed = body.get("allowed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true); // default to allowed if response format unexpected
+                let reason = body.get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no reason");
+                println!(
+                    "[whitecircle] {} guard: allowed={} reason={}",
+                    guard_type, allowed, reason
+                );
+                Ok(allowed)
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                println!(
+                    "[whitecircle] {} guard returned HTTP {}: {}",
+                    guard_type, status, body.chars().take(200).collect::<String>()
+                );
+                // Non-success HTTP: if strict, block; otherwise pass
+                if strict {
+                    Err(format!("WhiteCircle guard error (HTTP {})", status))
+                } else {
+                    Ok(true)
+                }
+            }
+        }
+        Err(err) => {
+            println!("[whitecircle] {} guard network error: {}", guard_type, err);
+            if strict {
+                Err(format!("WhiteCircle guard unreachable: {}", err))
+            } else {
+                Ok(true) // graceful degradation
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn run_shell_cmd(guards: State<'_, RuntimeGuards>, command: String) -> Result<String, String> {
+    if guards.estop.load(Ordering::SeqCst) {
+        return Err("Emergency stop active".to_string());
+    }
+
+    let n = guards.actions.fetch_add(1, Ordering::SeqCst);
+    if n >= MAX_ACTIONS_PER_RUN {
+        guards.estop.store(true, Ordering::SeqCst);
+        return Err("Max actions reached; E-STOP engaged".to_string());
+    }
+
+    // ── WhiteCircle input guard ──
+    let input_safe = whitecircle_guard(&command, "input").await?;
+    if !input_safe {
+        return Err(format!(
+            "Command blocked by WhiteCircle guardrail: {}",
+            command.chars().take(100).collect::<String>()
+        ));
+    }
+
+    println!("[shell] executing: {}", command);
+    let started = Instant::now();
+
+    // Spawn with timeout
+    let child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+
+    let output = tokio_timeout(child).await?;
+
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    if !output.stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str("[stderr] ");
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Truncate to avoid blowing up model context
+    if combined.len() > MAX_SHELL_OUTPUT_BYTES {
+        combined.truncate(MAX_SHELL_OUTPUT_BYTES);
+        combined.push_str("\n... (output truncated)");
+    }
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let elapsed_ms = started.elapsed().as_millis();
+    println!(
+        "[shell] exit={} ms={} output_bytes={} action_count={}",
+        exit_code, elapsed_ms, combined.len(), n + 1
+    );
+
+    // ── WhiteCircle output guard ──
+    let output_safe = whitecircle_guard(&combined, "output").await?;
+    if !output_safe {
+        return Ok("[output redacted by WhiteCircle guardrail]".to_string());
+    }
+
+    Ok(combined)
+}
+
+/// Wait for a child process with a timeout; kill it if it exceeds SHELL_TIMEOUT_SECS.
+fn tokio_timeout(mut child: std::process::Child) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::process::Output, String>> + Send>> {
+    Box::pin(async move {
+        let deadline = Instant::now() + Duration::from_secs(SHELL_TIMEOUT_SECS);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    return child.wait_with_output().map_err(|e| format!("shell output error: {}", e));
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return Err(format!("Shell command timed out after {}s", SHELL_TIMEOUT_SECS));
+                    }
+                    // Yield briefly
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("Error waiting for shell: {}", e)),
+            }
+        }
+    })
+}
+
 fn init_display_scale(display_state: &DisplayState) {
     let from_nsscreen = primary_backing_scale_factor().unwrap_or(0.0);
     let from_xcap = primary_monitor()
@@ -1417,6 +1636,7 @@ fn main() {
             execute_real_click_cmd,
             press_keys_cmd,
             type_text_cmd,
+            run_shell_cmd,
             recording::start_session_cmd,
             recording::stop_session_cmd,
             recording::session_status_cmd,

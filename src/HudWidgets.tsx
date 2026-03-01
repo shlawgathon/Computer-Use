@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from "react";
 // ── Types ──────────────────────────────────────────────
 
 export type AgentStep = {
-  phase: "capture" | "thinking" | "click" | "hotkey" | "type" | "done" | "error";
+  phase: "capture" | "thinking" | "click" | "hotkey" | "type" | "shell" | "done" | "error";
   step: number;
   max_steps: number;
   message: string;
