@@ -1639,7 +1639,7 @@ GATE 1 — OBJECTIVE CHECK (HIGHEST PRIORITY):\n\
   Look at the screenshot AND the CURRENT OS STATE in the user message.\n\
   The OS state tells you: frontmost app, window title, app-specific state (e.g. Spotify playing/paused).\n\
   Ask: Has the objective been achieved?\n\
-  → YES: Return {\\"action\\":\\"none\\", \\"x_norm\\":0, \\"y_norm\\":0, \\"confidence\\":1, \\"reason\\":\\"Objective achieved: [describe what you see confirming it]\\"} IMMEDIATELY. Do not take any other action.\n\
+  → YES: Return action=none with reason describing what confirms the objective. IMMEDIATELY. Do not take any other action.\n\
   → NO: Proceed to Gate 2.\n\
   Examples of DONE states:\n\
     - Task: \"pause Spotify\" → App state shows paused, or you see the pause button changed to play → DONE\n\

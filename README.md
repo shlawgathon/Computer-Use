@@ -10,7 +10,7 @@ Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on m
 
 ### Vision-First Agent Loop
 
-- Captures the screen, sends it to a vision model (OpenRouter), and executes the model's decision — all in a tight loop.
+- Captures the screen, sends it to a vision model (Mistral API), and executes the model's decision — all in a tight loop.
 - Supports **click**, **hotkey**, **type**, **shell** (CLI commands), and **none** (task complete) actions.
 - Step history is passed between iterations so the agent remembers what it already did.
 - Configurable confidence threshold — low-confidence actions are rejected automatically.
@@ -60,7 +60,7 @@ Every inference call assembles a rich prompt from **7 distinct sources** — thi
 
 ### Model
 
-Uses **Mistral Large 3** (`mistralai/mistral-large-2512`) via OpenRouter for all vision inference.
+Uses **Mistral Large 3** (`mistralai/mistral-large-2512`) via the Mistral API for all vision inference. OpenRouter is also supported as an alternative provider.
 
 - Model selection persists across sessions via `localStorage`.
 - Saved sessions remember which model was used and auto-select it on replay.
@@ -211,7 +211,7 @@ session-<unix-ms>/
 | Mouse Click         | `core-graphics` CGEvent (virtual cursor)  |
 | Keyboard Actuation  | `enigo`                                   |
 | Input Event Capture | `rdev` (global mouse/keyboard listener)   |
-| Vision Model        | OpenRouter API (Mistral, configurable)    |
+| Vision Model        | Mistral API (OpenRouter also supported)   |
 | HTTP Client         | `reqwest` + `openrouter-rs`               |
 | AI Guardrails       | WhiteCircle API (input/output protection) |
 | Styling             | Vanilla CSS with glassmorphism, dark mode |
@@ -221,8 +221,14 @@ session-<unix-ms>/
 Create `.env` in repo root:
 
 ```bash
-OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
-OPENROUTER_API_BASE=https://openrouter.ai/api/v1
+# Mistral API (primary)
+MISTRAL_API_KEY=YOUR_MISTRAL_API_KEY
+MISTRAL_API_BASE=https://api.mistral.ai/v1
+
+# Or use OpenRouter instead
+# OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
+# OPENROUTER_API_BASE=https://openrouter.ai/api/v1
+
 AGENT_CONFIDENCE_THRESHOLD=0.60
 AGENT_INFER_MAX_DIM=2048
 
