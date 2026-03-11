@@ -1,5 +1,5 @@
 [package]
-name = "agenticify"
+name = "computer-use"
 version = "0.1.0"
 description = "Vision-first desktop automation agent"
 authors = ["xiao"]

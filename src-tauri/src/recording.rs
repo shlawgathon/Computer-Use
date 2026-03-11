@@ -30,7 +30,7 @@ use xcap::Monitor;
 // ── Constants ──────────────────────────────────────────
 
 fn recordings_root() -> PathBuf {
-    std::env::temp_dir().join("agenticify-recordings")
+    std::env::temp_dir().join("computer-use-recordings")
 }
 
 fn now_ms() -> Result<u128, String> {
@@ -116,6 +116,13 @@ pub struct StartSessionRequest {
 }
 
 #[tauri::command]
+pub fn recordings_root_cmd() -> Result<String, String> {
+    let root = recordings_root();
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    Ok(root.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 pub fn start_session_cmd(
     state: State<SessionRecordingState>,
     req: StartSessionRequest,
@@ -160,24 +167,25 @@ pub fn start_session_cmd(
             // capture_primary_cmd (agent loop). If the lock is held,
             // try_lock returns Err and we skip this frame gracefully.
             // IMPORTANT: only hold the lock during capture, NOT during save.
-            let captured: Vec<(u32, image::DynamicImage)> = if let Ok(_guard) = crate::capture_mutex().try_lock() {
-                let mut frames = Vec::new();
-                if let Ok(monitors) = Monitor::all() {
-                    for monitor in monitors {
-                        let monitor_id = match monitor.id() {
-                            Ok(id) => id,
-                            Err(_) => continue,
-                        };
-                        if let Ok(image) = monitor.capture_image() {
-                            frames.push((monitor_id, image::DynamicImage::from(image)));
+            let captured: Vec<(u32, image::DynamicImage)> =
+                if let Ok(_guard) = crate::capture_mutex().try_lock() {
+                    let mut frames = Vec::new();
+                    if let Ok(monitors) = Monitor::all() {
+                        for monitor in monitors {
+                            let monitor_id = match monitor.id() {
+                                Ok(id) => id,
+                                Err(_) => continue,
+                            };
+                            if let Ok(image) = monitor.capture_image() {
+                                frames.push((monitor_id, image::DynamicImage::from(image)));
+                            }
                         }
                     }
-                }
-                frames
-                // _guard dropped here — lock released before disk I/O
-            } else {
-                Vec::new() // agent is capturing — skip this recording frame
-            };
+                    frames
+                    // _guard dropped here — lock released before disk I/O
+                } else {
+                    Vec::new() // agent is capturing — skip this recording frame
+                };
 
             // Save frames to disk OUTSIDE the lock
             for (monitor_id, image) in captured {
@@ -319,12 +327,8 @@ pub fn start_session_cmd(
     Ok(status)
 }
 
-// ── Stop Recording ─────────────────────────────────────
-
 #[tauri::command]
-pub fn stop_session_cmd(
-    state: State<SessionRecordingState>,
-) -> Result<SessionManifest, String> {
+pub fn stop_session_cmd(state: State<SessionRecordingState>) -> Result<SessionManifest, String> {
     let mut guard = state
         .active
         .lock()
@@ -391,12 +395,8 @@ pub fn stop_session_cmd(
     Ok(manifest)
 }
 
-// ── Session Status ─────────────────────────────────────
-
 #[tauri::command]
-pub fn session_status_cmd(
-    state: State<SessionRecordingState>,
-) -> SessionStatus {
+pub fn session_status_cmd(state: State<SessionRecordingState>) -> SessionStatus {
     match state.active.lock() {
         Ok(guard) => {
             if let Some(active) = guard.as_ref() {
@@ -428,8 +428,6 @@ pub fn session_status_cmd(
     }
 }
 
-// ── List Sessions ──────────────────────────────────────
-
 #[tauri::command]
 pub fn list_sessions_cmd() -> Result<Vec<SessionManifest>, String> {
     let root = recordings_root();
@@ -460,25 +458,18 @@ pub fn list_sessions_cmd() -> Result<Vec<SessionManifest>, String> {
     Ok(sessions)
 }
 
-// ── Load Session ───────────────────────────────────────
-
 #[tauri::command]
 pub fn load_session_cmd(session_id: String) -> Result<SessionManifest, String> {
-    let manifest_path = recordings_root()
-        .join(&session_id)
-        .join("manifest.json");
+    let manifest_path = recordings_root().join(&session_id).join("manifest.json");
 
     if !manifest_path.exists() {
         return Err(format!("Session '{}' not found", session_id));
     }
 
     let text = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
-    let manifest: SessionManifest =
-        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let manifest: SessionManifest = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     Ok(manifest)
 }
-
-// ── Delete Session ─────────────────────────────────────
 
 #[tauri::command]
 pub fn delete_session_cmd(session_id: String) -> Result<(), String> {
@@ -488,8 +479,6 @@ pub fn delete_session_cmd(session_id: String) -> Result<(), String> {
     }
     Ok(())
 }
-
-// ── Activity Log Persistence ───────────────────────────
 
 #[tauri::command]
 pub fn save_activity_log_cmd(
@@ -514,10 +503,10 @@ pub fn save_activity_log_cmd(
 }
 
 #[tauri::command]
-pub fn load_activity_log_cmd(
-    session_id: String,
-) -> Result<Vec<serde_json::Value>, String> {
-    let path = recordings_root().join(&session_id).join("activity_log.json");
+pub fn load_activity_log_cmd(session_id: String) -> Result<Vec<serde_json::Value>, String> {
+    let path = recordings_root()
+        .join(&session_id)
+        .join("activity_log.json");
 
     if !path.exists() {
         // Graceful fallback for old sessions without an activity log
@@ -525,7 +514,6 @@ pub fn load_activity_log_cmd(
     }
 
     let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let log: Vec<serde_json::Value> =
-        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let log: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     Ok(log)
 }

@@ -1,4 +1,4 @@
-# Agenticify
+# Computer Use
 
 **OS-native vision automation agent** — record yourself, teach the AI, and let it repeat your workflows autonomously.
 
@@ -11,7 +11,8 @@ Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on m
 ### Vision-First Agent Loop
 
 - Captures the screen, sends it to a vision model (Mistral API), and executes the model's decision — all in a tight loop.
-- Supports **click**, **hotkey**, **type**, **shell** (CLI commands), and **none** (task complete) actions.
+- The model now selects **named tools** instead of emitting raw action JSON. Core tools are `click_target`, `type_text`, `run_shell`, and `task_done`, plus a catalog of named shortcut tools such as `browser_new_tab` and `system_open_spotlight`.
+- Tool calls are still normalized into the internal action types **click**, **hotkey**, **type**, **shell**, and **none** for execution, telemetry, and session logs.
 - Step history is passed between iterations so the agent remembers what it already did.
 - Configurable confidence threshold — low-confidence actions are rejected automatically.
 - **Window context awareness** — detects the currently active application and window title, feeding it to the model so it understands the current context.
@@ -48,22 +49,31 @@ Every inference call assembles a rich prompt from **7 distinct sources** — thi
 
 | Layer                         | Source                                                       | Injected Into               | Description                                                                                                                                                                                                                                                       |
 | ----------------------------- | ------------------------------------------------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1. System Prompt**          | `main.rs` (hardcoded)                                        | `system` message            | Full action schema (click, hotkey, type, shell, none), Spotlight navigation rules, stopping criteria, text editing patterns, click accuracy heuristics, hotkey reference                                                                                          |
+| **1. System Prompt**          | `vision.rs` (hardcoded)                                      | `system` message            | Tool-calling instructions, gating rules, Spotlight navigation rules, stopping criteria, text editing patterns, click accuracy heuristics, and shortcut-tool preference                                                                                             |
 | **2. Screenshot**             | `xcap` screen capture                                        | `user` message (image part) | PNG of the primary monitor, adaptively downscaled to `AGENT_INFER_MAX_DIM` (default 2048px). Encoded as base64 data URI                                                                                                                                           |
 | **3. Task Instruction**       | User input (HUD / dashboard)                                 | `user` message (text)       | The natural-language goal, e.g. "Open Chrome and go to github.com"                                                                                                                                                                                                |
 | **4. Coordinate System**      | Computed from screenshot dims                                | `user` message (text)       | Pixel coordinate bounds: `"The screenshot image is {W}x{H} pixels… (0,0) is top-left…"`                                                                                                                                                                           |
 | **5. OS Context**             | `gather_os_context()` via AppleScript                        | `user` message (text)       | **Frontmost app** name + **window title**, **running GUI apps** list, **open window names** in frontmost app, **app-specific state** (e.g. Spotify track, Chrome URL, Finder path — queried via per-app AppleScript with 2s kill timeout), **system time** (unix) |
-| **6. App-Specific Shortcuts** | `shortcuts::get_or_fetch_global()` via LLM                   | `user` message (text)       | Top 20 macOS keyboard shortcuts for the frontmost app, dynamically fetched on first encounter and session-cached                                                                                                                                                  |
-| **7. Step History**           | `stepHistory[]` (in-memory, frontend) + `getWindowContext()` | `user` message (text)       | Accumulated action log from prior steps in the current run: `"Step 1: click (x,y) — reason"`, `"Step 2: hotkey Cmd+T — reason"`, etc. Includes the currently active window context at the top                                                                     |
+| **6. App-Specific Shortcuts** | `shortcuts::get_or_fetch_global()` via LLM                   | `user` message (text)       | Top 20 macOS keyboard shortcuts for the frontmost app, dynamically fetched on first encounter, parsed into `app_*` tool definitions when possible, and session-cached                                                                                            |
+| **7. Step History**           | `stepHistory[]` (in-memory, frontend) + `getWindowContext()` | `user` message (text)       | Accumulated action log from prior steps in the current run: `"Step 1: click (x,y) — reason"`, `"Step 2: hotkey Meta+t+Meta — reason"`, etc. Includes the currently active window context at the top                                                              |
 
 **What is NOT persisted**: The full model prompt, raw model response, and thinking/reasoning traces are **not saved** to disk. Only the extracted `VisionAction` (action, coordinates, confidence, reason) survives — optionally written to `activity_log.json` per session. Step history lives in-memory for the duration of one agent run only.
 
-### Model
+### Models
 
-Uses **Mistral Large 3** (`mistralai/mistral-large-2512`) via the Mistral API for all vision inference.
+Vision inference routes through **OpenRouter**, so you can switch models without changing API keys. Currently supported:
+
+| ID                                              | Label                              |
+| ----------------------------------------------- | ---------------------------------- |
+| `mistralai/mistral-large-2512`                  | Mistral Large 3 (default)          |
+| `qwen/qwen3.5-35b-a3b`                         | Qwen 3.5 35B A3B                   |
+| `openai/gpt-5.4`                                | GPT-5.4                            |
+| `anthropic/claude-sonnet-4.6`                    | Claude Sonnet 4.6                  |
+| `google/gemini-3.1-pro-preview-customtools`     | Gemini 3.1 Pro Preview (Custom Tools) |
 
 - Model selection persists across sessions via `localStorage`.
 - Saved sessions remember which model was used and auto-select it on replay.
+- **Cost tracking** — each inference returns token usage and estimated USD cost. Totals are logged per run and per replay.
 
 ### Shortcuts-First Navigation
 
@@ -72,9 +82,95 @@ The agent **always prefers keyboard shortcuts over clicking** — clicking is th
 - **Dynamic shortcut discovery** — on first encounter with any app (Spotify, Chrome, VS Code, etc.), the agent makes a lightweight LLM call to fetch the top 20 macOS shortcuts for that app.
 - **Session-scoped cache** — shortcuts are cached per app name in memory, so subsequent agent steps with the same app pay zero latency.
 - **System apps skipped** — loginwindow, Dock, SystemUIServer, and other system processes are automatically excluded.
-- **Static fallback** — the system prompt also includes a built-in reference for browser, macOS, Finder, and Terminal shortcuts.
-- **Priority order** — app-specific shortcuts → generic hotkeys → clicking (last resort).
-- **Wrong-app safety** — if the frontmost app is not the target app, the agent will **never click** (guaranteed wrong target). Instead it uses Cmd+Space Spotlight to switch to the correct app first.
+- **Static fallback** — the system prompt also includes a built-in catalog of named shortcut tools for browser, macOS, editing, and navigation actions.
+- **Priority order** — app-specific `app_*` tools → built-in shortcut tools → clicking (last resort).
+- **Wrong-app safety** — if the frontmost app is not the target app, the agent will **never click** (guaranteed wrong target). Instead it uses the `system_open_spotlight` tool, then `type_text`, then usually `press_return`.
+
+### Tool Catalog
+
+The model is expected to call exactly one tool on each step. These are the built-in tools currently registered in `vision.rs`.
+
+```mermaid
+flowchart LR
+    APP["Frontmost app name"]
+    CACHE["Session shortcut cache"]
+    FETCH["OpenRouter shortcut lookup"]
+    PARSE["Parse 'Shortcut - Description' lines"]
+    APPTOOLS["Dynamic app_* tools"]
+    BUILTIN["Built-in local tools<br/>browser_*, system_*, edit_*, press_*, move_*"]
+    CORE["Core tools<br/>click_target, type_text, run_shell, task_done"]
+    REGISTRY["Per-step tool registry"]
+    MODEL["Vision model"]
+    ACTION["Resolved internal action<br/>click / hotkey / type / shell / none"]
+
+    APP --> CACHE
+    CACHE -->|miss| FETCH
+    FETCH --> PARSE
+    CACHE -->|hit| PARSE
+    PARSE --> APPTOOLS
+    BUILTIN --> REGISTRY
+    CORE --> REGISTRY
+    APPTOOLS --> REGISTRY
+    REGISTRY --> MODEL
+    MODEL --> ACTION
+```
+
+#### Core tools
+
+| Tool | Meaning |
+| ---- | ------- |
+| `click_target` | Click a target using pixel coordinates from the current screenshot |
+| `type_text` | Type text into the currently focused control |
+| `run_shell` | Run a shell command when the user explicitly asked for terminal/CLI work |
+| `task_done` | Mark the task complete when the goal is visually confirmed |
+
+#### Browser shortcut tools
+
+| Tool | Shortcut |
+| ---- | -------- |
+| `browser_focus_address_bar` | `Cmd+L` |
+| `browser_new_tab` | `Cmd+T` |
+| `browser_close_tab` | `Cmd+W` |
+| `browser_reload` | `Cmd+R` |
+| `browser_back` | `Cmd+[` |
+| `browser_forward` | `Cmd+]` |
+
+#### System and editing shortcut tools
+
+| Tool | Shortcut |
+| ---- | -------- |
+| `system_open_spotlight` | `Cmd+Space` |
+| `system_quit_app` | `Cmd+Q` |
+| `edit_select_all` | `Cmd+A` |
+| `edit_copy` | `Cmd+C` |
+| `edit_paste` | `Cmd+V` |
+| `file_save` | `Cmd+S` |
+
+#### Navigation and keypress tools
+
+| Tool | Shortcut |
+| ---- | -------- |
+| `press_return` | `Return` |
+| `press_escape` | `Escape` |
+| `press_tab` | `Tab` |
+| `press_shift_tab` | `Shift+Tab` |
+| `press_space` | `Space` |
+| `press_backspace` | `Backspace` |
+| `press_delete` | `Delete` |
+| `move_up` | `Up` |
+| `move_down` | `Down` |
+| `move_left` | `Left` |
+| `move_right` | `Right` |
+| `press_home` | `Home` |
+| `press_end` | `End` |
+| `press_page_up` | `PageUp` |
+| `press_page_down` | `PageDown` |
+
+#### Dynamic app-specific tools
+
+- When app shortcuts can be parsed into a single key combo, the backend registers additional tools named like `app_new_tab`, `app_toggle_sidebar`, or `app_move_tab_left`.
+- These dynamic tools are derived from `Shortcut - Description` lines returned by `get_app_shortcuts_cmd`.
+- If a shortcut line cannot be parsed into one combo, it is kept as prompt context only and does not become a callable tool.
 
 ### Floating HUD (Always-On-Top)
 
@@ -98,6 +194,8 @@ A compact, transparent pill that floats above everything — your command center
 ### Session Recording & Replay
 
 Record yourself performing a task — the AI watches, learns, and can repeat it.
+
+The backend now uses a single session recording implementation in `recording.rs`. The older screenshot-only recorder has been removed, so the dashboard and HUD both talk to the same session lifecycle.
 
 **Recording captures:**
 
@@ -143,40 +241,118 @@ Record yourself performing a task — the AI watches, learns, and can repeat it.
 ## Architecture
 
 ```mermaid
-flowchart TD
-    subgraph HUD["Floating HUD"]
-        CMD[Command Panel] --> LOOP[Agent Loop]
-        REC[Record Panel] --> SESSION[Session Recording]
-        ACT[Activity Feed] --> TS[Timestamped Steps]
-        MOD[Model Selector] --> LOOP
+flowchart LR
+    subgraph FE["Frontend Windows"]
+        MAIN["Main dashboard<br/>Run / Sessions / Dev Tools"]
+        HUD["Floating HUD<br/>command, record, replay"]
+        OVERLAY["Transparent overlay<br/>cursor pulse + blue border"]
+        RUNNER["agentRunner.ts<br/>shared capture → infer → execute loop"]
+        MAIN --> RUNNER
+        HUD --> RUNNER
     end
 
-    subgraph Backend["Rust Backend"]
-        CAP[xcap Screen Capture] --> INF[Vision Model Inference]
-        CTX[Window Context] --> INF
-        INF --> EXEC{Action Router}
-        EXEC -->|click| CLICK["CGEvent Synthetic Click"]
-        EXEC -->|hotkey| KEYS[enigo Keyboard]
-        EXEC -->|type| TYPE[enigo Text Input]
-        EXEC -->|shell| SHELL["Shell Command"]
-        EXEC -->|none| DONE[Task Complete]
-        SHELL --> WC{WhiteCircle Guard}
-        WC -->|allowed| RUN[Execute + Capture Output]
-        WC -->|blocked| REJECT[Reject Command]
-        RDEV[rdev Input Listener] --> EVENTS[Input Events]
+    subgraph TAURI["Tauri / Rust backend"]
+        ROOT["main.rs<br/>composition root, state, command registry"]
+        VISION["vision.rs<br/>prompt build, image compression, model call, tool parsing"]
+        OSX["os_context.rs<br/>frontmost app, AppleScript state, window context"]
+        RECORD["recording.rs<br/>session capture, input listener, manifests, activity logs"]
+        SHELL["shell.rs<br/>WhiteCircle guard + shell execution"]
+        SHORTCUTS["shortcuts.rs<br/>LLM shortcut lookup + cache"]
+        MODELS["models.rs<br/>shared request/response types"]
+        ROOT --> VISION
+        ROOT --> OSX
+        ROOT --> RECORD
+        ROOT --> SHELL
+        ROOT --> SHORTCUTS
+        ROOT --> MODELS
     end
 
-    subgraph Storage["Session Storage"]
-        FRAMES[frame-*.png] --> MANIFEST[manifest.json]
-        EVENTS --> INPUT_JSON[input_events.json]
-        ACTIVITY[activity_log.json]
+    subgraph LOOP["Agent decision loop"]
+        CAP["capture_primary_cmd"]
+        PROMPT["instruction + task context<br/>+ OS context + shortcut tools + step history"]
+        INFER["infer_click_cmd"]
+        ROUTER{"tool call"}
+        CLICK["CGEvent click"]
+        HOTKEY["named shortcut tool<br/>→ enigo hotkey"]
+        TYPE["enigo text input"]
+        SH["guarded shell command"]
+        NONE["stop"]
+        CAP --> PROMPT --> INFER --> ROUTER
+        ROUTER --> CLICK
+        ROUTER --> HOTKEY
+        ROUTER --> TYPE
+        ROUTER --> SH
+        ROUTER --> NONE
     end
 
-    LOOP --> CAP
-    SESSION --> CAP
-    SESSION --> RDEV
-    CLICK --> OVERLAY[Overlay Cursor Pulse]
+    subgraph STORAGE["Session persistence"]
+        MANIFEST["manifest.json"]
+        INPUTS["input_events.json"]
+        ACTIVITY["activity_log.json"]
+        FRAMES["monitor-*/frame-*.png"]
+    end
+
+    RUNNER --> ROOT
+    CAP --> OVERLAY
+    CLICK --> OVERLAY
+    RECORD --> FRAMES
+    RECORD --> INPUTS
+    RECORD --> MANIFEST
+    RUNNER --> ACTIVITY
+    OSX --> PROMPT
+    SHORTCUTS --> PROMPT
+    SHELL --> SH
 ```
+
+## Backend Architecture
+
+The Rust backend is no longer a monolithic `main.rs`. `main.rs` is now the Tauri composition root: it owns shared runtime state, low-level input/capture helpers, plugin setup, and command registration. The feature logic lives in focused modules:
+
+```text
+src-tauri/src/
+├── main.rs         # app setup, shared helpers, command wiring
+├── models.rs       # shared request/response and runtime types
+├── vision.rs       # prompt assembly, screenshot preprocessing, tool registry and response parsing
+├── os_context.rs   # AppleScript-based app/window/system context
+├── recording.rs    # session recording, input capture, manifest/activity persistence
+├── shell.rs        # WhiteCircle validation and shell command execution
+└── shortcuts.rs    # app shortcut discovery and in-memory caching
+```
+
+This split matters for debugging: session issues stay in `recording.rs`, model/output issues stay in `vision.rs`, and macOS context problems stay in `os_context.rs` instead of being buried in one multi-thousand-line file.
+
+## Frontend Architecture
+
+The frontend is split into focused modules for maintainability:
+
+```
+src/
+├── App.tsx                       # Router — delegates to window components
+├── types.ts                      # Shared TypeScript type definitions
+├── constants.ts                  # Labels, model options, dimensions
+├── lib/
+│   ├── tauri.ts                 # Tauri invoke wrappers, window management
+│   └── agentRunner.ts           # Deduplicated capture→infer→execute loop
+├── hooks/
+│   └── useAgentLoop.ts          # Agent loop state & controls
+├── components/
+│   ├── OverlayWindow.tsx        # Transparent cursor overlay
+│   ├── HudWindow.tsx            # Floating HUD pill (activity, command, record)
+│   ├── MainApp.tsx              # Dashboard orchestrator
+│   ├── RunTab.tsx               # Run tab — health + live command
+│   ├── SessionsTab.tsx          # Sessions tab — recording + replay
+│   ├── DevTab.tsx               # Dev Tools tab — step controls + raw data
+│   ├── HealthGrid.tsx           # Reusable status chip grid
+│   ├── ModelActivityPanel.tsx   # Model activity sidebar
+│   └── ActivityLogPanel.tsx     # Activity log sidebar
+├── HudWidgets.tsx               # ElapsedTimer, ActivityFeed components
+├── shortcuts.tsx                # App shortcut fetching
+├── taskRunLock.ts               # Task run mutex via backend
+├── main.tsx                     # React entry point
+└── styles.css                   # All styling (dark/light, glassmorphism)
+```
+
+The agent loop logic (`capture → infer → execute → emit`) lives in a single `agentRunner.ts` module, shared by both the HUD and the main dashboard — no duplication.
 
 ## Session Data Format
 
@@ -240,6 +416,8 @@ bun install
 bun run tauri:dev
 ```
 
+This repo is Bun-only on the frontend side. Use `bun run build` for production assets and avoid `npm`, `pnpm`, or `yarn`.
+
 Requires macOS with **Screen Recording** and **Accessibility** permissions (prompted on first launch).
 
 ## Backend Commands
@@ -249,17 +427,20 @@ Requires macOS with **Screen Recording** and **Accessibility** permissions (prom
 | Command                  | Description                                     |
 | ------------------------ | ----------------------------------------------- |
 | `capture_primary_cmd`    | Capture primary monitor screenshot              |
-| `infer_click_cmd`        | Send screenshot + instruction to vision model   |
+| `infer_click_cmd`        | Send screenshot + instruction to vision model and resolve one tool call |
 | `execute_real_click_cmd` | Perform CGEvent synthetic click at pixel coords |
-| `press_keys_cmd`         | Execute keyboard shortcuts                      |
+| `press_keys_cmd`         | Execute resolved shortcut key sequences         |
 | `type_text_cmd`          | Type text string                                |
 | `run_shell_cmd`          | Execute shell command with WhiteCircle guard    |
 | `get_frontmost_app_cmd`  | Get active window name and title                |
+| `open_path_cmd`          | Open a folder or file in Finder                 |
+| `export_markdown_cmd`    | Export recorded activity as Markdown            |
 
 ### Sessions (recording.rs)
 
 | Command                 | Description                                   |
 | ----------------------- | --------------------------------------------- |
+| `recordings_root_cmd`   | Return the root folder for all saved sessions |
 | `start_session_cmd`     | Start recording (frames + rdev input capture) |
 | `stop_session_cmd`      | Stop recording, save manifest + input events  |
 | `session_status_cmd`    | Get current recording status                  |

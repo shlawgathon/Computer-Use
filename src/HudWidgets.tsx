@@ -7,6 +7,8 @@ export type AgentStep = {
   step: number;
   max_steps: number;
   message: string;
+  cost_usd?: number;
+  token_total?: number;
 };
 
 export type TimestampedStep = AgentStep & {

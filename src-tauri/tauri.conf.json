@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Agenticify",
+  "productName": "Computer Use",
   "version": "0.1.0",
-  "identifier": "com.agenticify.desktop",
+  "identifier": "com.computeruse.desktop",
   "build": {
     "beforeDevCommand": "bun run dev",
     "beforeBuildCommand": "bun run build",
@@ -14,7 +14,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "Agenticify",
+        "title": "Computer Use",
         "width": 1200,
         "height": 900,
         "resizable": true,

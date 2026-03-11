@@ -1,4 +1,4 @@
-# Agenticify Walkthrough
+# Computer Use Walkthrough
 
 ## 1. Install + Start
 
@@ -9,13 +9,13 @@ bun run tauri:dev
 
 This starts:
 - Vite frontend
-- Tauri app bundle (`Agenticify`) with Rust backend
+- Tauri app bundle (`Computer Use`) with Rust backend
 - Overlay window (transparent, always-on-top) for agent cursor visualization
 - Top HUD window (always-on-top status strip)
 
 ## 2. Configure Provider
 
-Create `.env` in `/Users/xiao/Agenticify`:
+Create `.env` in `/Users/xiao/Computer-Use`:
 
 ```bash
 OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
@@ -30,7 +30,7 @@ Then restart `bun run tauri:dev`.
 
 ## 3. Grant macOS Permissions
 
-In Agenticify:
+In Computer Use:
 1. Open **Run** tab.
 2. Click `Request` in the permissions section.
 3. Enable:
@@ -65,9 +65,9 @@ flowchart LR
 ## 5. Record a Real Session
 
 In **Sessions** tab:
-1. Click `Start Recording`.
+1. Click `Record`.
 2. Perform your real OS workflow (entire desktop is captured).
-3. Click `Stop & Save`.
+3. Click `Stop Recording`.
 
 ## 6. Replay a Saved Session
 
@@ -76,15 +76,15 @@ In **Sessions** tab:
 2. Set instruction/model if needed.
 3. Click `Replay Session`.
 
-This uses latest frame from that session and performs real infer + click.
+This re-runs the agent loop using the saved session metadata, model, and optional activity log persistence.
 
 ```mermaid
 flowchart LR
-  A["Select session"] --> B["latest frame PNG"]
-  B --> C["infer_click_cmd"]
-  C --> D{"click?"}
-  D -- "yes" --> E["execute_real_click_cmd"]
-  D -- "no" --> F["No click"]
+  A["Select session"] --> B["session manifest"]
+  B --> C["runAgentLoop"]
+  C --> D["capture_primary_cmd"]
+  D --> E["infer_click_cmd"]
+  E --> F["execute inferred action"]
 ```
 
 ## 7. Find Stored Data
@@ -96,7 +96,7 @@ In **Sessions**:
 Typical macOS location:
 
 ```text
-/var/folders/.../T/agenticify-recordings/
+/var/folders/.../T/computer-use-recordings/
 ```
 
 Session structure:
@@ -104,6 +104,8 @@ Session structure:
 ```text
 session-<unix-ms>/
   manifest.json
+  activity_log.json
+  input_events.json
   monitor-<id>/frame-000001.png
 ```
 
@@ -121,7 +123,7 @@ session-<unix-ms>/
 - Top HUD controls (header):
   - `Show Top HUD` / `Hide Top HUD`
 - If main window is minimized/hidden:
-  - Double-click the top notch to restore Agenticify window
+  - Double-click the top notch to restore Computer Use window
   - Or press `Cmd+Shift+Enter` to force restore main window
 
 If E-STOP is on, clicks are blocked.

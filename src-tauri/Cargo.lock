@@ -63,30 +63,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agenticify"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "core-graphics 0.24.0",
- "dirs",
- "dotenvy",
- "enigo",
- "image",
- "macos-accessibility-client",
- "objc2",
- "objc2-app-kit",
- "openrouter-rs",
- "rdev",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-global-shortcut",
- "xcap",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,6 +703,30 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes 1.11.1",
  "memchr",
+]
+
+[[package]]
+name = "computer-use"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "core-graphics 0.24.0",
+ "dirs",
+ "dotenvy",
+ "enigo",
+ "image",
+ "macos-accessibility-client",
+ "objc2",
+ "objc2-app-kit",
+ "openrouter-rs",
+ "rdev",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-global-shortcut",
+ "xcap",
 ]
 
 [[package]]

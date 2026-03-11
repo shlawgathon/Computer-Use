@@ -1,12 +1,14 @@
 {
-  "name": "agenticify",
+  "name": "computer-use",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "bun@1.2.22",
   "scripts": {
-    "dev": "node ./node_modules/vite/bin/vite.js",
-    "build": "node ./node_modules/typescript/bin/tsc && node ./node_modules/vite/bin/vite.js build",
-    "preview": "node ./node_modules/vite/bin/vite.js preview",
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "test": "bun test",
+    "preview": "vite preview",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },

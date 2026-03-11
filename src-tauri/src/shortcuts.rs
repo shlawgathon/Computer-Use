@@ -33,7 +33,8 @@ const SKIP_APPS: &[&str] = &[
     "universalcontrol",
     "dock",
     "screencaptureui",
-    "agenticify",
+    "computer use",
+    "computer-use",
     "controlcenter",
     "notificationcenter",
     "wallpaper",
@@ -81,9 +82,9 @@ pub fn clear_global_cache() {
 /// Fetch shortcuts for `app_name` via an OpenRouter chat completion.
 async fn fetch_via_llm(app_name: &str, api_key: &str, api_base: &str) -> Result<String, String> {
     use openrouter_rs::{
-        OpenRouterClient,
         api::chat::{ChatCompletionRequest, Message},
         types::Role,
+        OpenRouterClient,
     };
 
     let prompt = format!(
@@ -98,16 +99,16 @@ async fn fetch_via_llm(app_name: &str, api_key: &str, api_base: &str) -> Result<
     let client = if api_base.contains("openrouter.ai") {
         OpenRouterClient::builder()
             .api_key(api_key)
-            .http_referer("https://agenticify.local")
-            .x_title("Agenticify-Shortcuts")
+            .http_referer("https://computer-use.local")
+            .x_title("Computer Use Shortcuts")
             .build()
             .map_err(|e| format!("Shortcuts client error: {}", e))?
     } else {
         OpenRouterClient::builder()
             .api_key(api_key)
             .base_url(api_base)
-            .http_referer("https://agenticify.local")
-            .x_title("Agenticify-Shortcuts")
+            .http_referer("https://computer-use.local")
+            .x_title("Computer Use Shortcuts")
             .build()
             .map_err(|e| format!("Shortcuts client error: {}", e))?
     };
@@ -128,7 +129,9 @@ async fn fetch_via_llm(app_name: &str, api_key: &str, api_base: &str) -> Result<
         .await
         .map_err(|e| format!("Shortcuts API error: {}", e))?;
 
-    let content = response.choices.first()
+    let content = response
+        .choices
+        .first()
         .and_then(|c| c.content())
         .ok_or_else(|| "No content in shortcuts response".to_string())?
         .to_string();
@@ -139,11 +142,7 @@ async fn fetch_via_llm(app_name: &str, api_key: &str, api_base: &str) -> Result<
 /// High-level helper using the global static cache: get shortcuts for
 /// `app_name`, using cache first, then LLM fetch. Returns the shortcuts
 /// text or an empty string on failure.
-pub async fn get_or_fetch_global(
-    app_name: &str,
-    api_key: &str,
-    api_base: &str,
-) -> String {
+pub async fn get_or_fetch_global(app_name: &str, api_key: &str, api_base: &str) -> String {
     if should_skip(app_name) {
         return String::new();
     }
@@ -155,10 +154,17 @@ pub async fn get_or_fetch_global(
     }
 
     // Fetch from LLM
-    println!("[shortcuts] fetching shortcuts for '{}' via LLM...", app_name);
+    println!(
+        "[shortcuts] fetching shortcuts for '{}' via LLM...",
+        app_name
+    );
     match fetch_via_llm(app_name, api_key, api_base).await {
         Ok(shortcuts) => {
-            println!("[shortcuts] fetched {} chars for '{}'", shortcuts.len(), app_name);
+            println!(
+                "[shortcuts] fetched {} chars for '{}'",
+                shortcuts.len(),
+                app_name
+            );
             set_cached_global(app_name, shortcuts.clone());
             shortcuts
         }
