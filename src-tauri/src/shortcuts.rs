@@ -1,28 +1,63 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs,
+    path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 
 // ── App Shortcuts Cache (LLM-Powered) ──────────────────
 //
 // Dynamically fetches keyboard shortcuts for the currently active
-// macOS application using the same OpenRouter/Mistral API the agent
-// already uses. Results are cached per app name for the session
-// lifetime so we only pay the LLM cost once per unique app.
+// macOS application using a cheap/free LLM model via OpenRouter.
+// Results are cached both in-memory and on disk so we only fetch once.
 
-/// Tauri-managed state (registered in main but not strictly needed for
-/// the global helpers below — kept for potential future Tauri-state usage).
+/// Cheaper model for shortcut lookups (free tier on OpenRouter).
+const SHORTCUTS_MODEL: &str = "meta-llama/llama-3.3-70b-instruct:free";
+
+/// Disk root for persistent shortcut storage.
+fn shortcuts_disk_root() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("computer-use")
+        .join("shortcuts")
+}
+
+/// Tauri-managed state (registered in main).
 #[derive(Default)]
 #[allow(dead_code)]
 pub struct ShortcutsCache {
     pub cache: Mutex<HashMap<String, String>>,
 }
 
-/// Global static cache so async `infer_click_cmd` can use it without
-/// needing Tauri `State<>`.
+/// Global static cache so async code can use it without Tauri `State<>`.
 fn global_cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    CACHE.get_or_init(|| {
+        // Pre-load from disk on first access
+        let mut map = HashMap::new();
+        let root = shortcuts_disk_root();
+        if root.is_dir() {
+            if let Ok(entries) = fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "txt").unwrap_or(false) {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            if let Ok(content) = fs::read_to_string(&path) {
+                                if !content.trim().is_empty() {
+                                    map.insert(stem.to_lowercase(), content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !map.is_empty() {
+                println!("[shortcuts] loaded {} apps from disk cache", map.len());
+            }
+        }
+        Mutex::new(map)
+    })
 }
 
 /// Apps that are system-level or have no meaningful shortcuts.
@@ -61,21 +96,30 @@ pub fn get_cached_global(app_name: &str) -> Option<String> {
     lock.get(&key).cloned()
 }
 
-/// Store shortcuts in the global cache.
+/// Store shortcuts in the global cache + persist to disk.
 fn set_cached_global(app_name: &str, shortcuts: String) {
     let key = app_name.trim().to_lowercase();
     if key.is_empty() {
         return;
     }
     if let Ok(mut lock) = global_cache().lock() {
-        lock.insert(key, shortcuts);
+        lock.insert(key.clone(), shortcuts.clone());
     }
+    // Persist to disk
+    let root = shortcuts_disk_root();
+    let _ = fs::create_dir_all(&root);
+    let path = root.join(format!("{}.txt", key));
+    let _ = fs::write(&path, &shortcuts);
 }
 
-/// Clear the entire global shortcuts cache.
+/// Clear the entire global shortcuts cache (memory + disk).
 pub fn clear_global_cache() {
     if let Ok(mut lock) = global_cache().lock() {
         lock.clear();
+    }
+    let root = shortcuts_disk_root();
+    if root.is_dir() {
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -114,7 +158,7 @@ async fn fetch_via_llm(app_name: &str, api_key: &str, api_base: &str) -> Result<
     };
 
     let request = ChatCompletionRequest::builder()
-        .model(super::DEFAULT_MISTRAL_MODEL)
+        .model(SHORTCUTS_MODEL)
         .messages(vec![
             Message::new(Role::System, "You are a keyboard shortcut reference. Respond ONLY with shortcut lines, nothing else."),
             Message::new(Role::User, prompt.as_str()),
@@ -139,9 +183,8 @@ async fn fetch_via_llm(app_name: &str, api_key: &str, api_base: &str) -> Result<
     Ok(content.trim().to_string())
 }
 
-/// High-level helper using the global static cache: get shortcuts for
-/// `app_name`, using cache first, then LLM fetch. Returns the shortcuts
-/// text or an empty string on failure.
+/// High-level helper: get shortcuts for `app_name`, checking cache first,
+/// then fetching via LLM. Returns the shortcuts text or empty on failure.
 pub async fn get_or_fetch_global(app_name: &str, api_key: &str, api_base: &str) -> String {
     if should_skip(app_name) {
         return String::new();
@@ -155,8 +198,8 @@ pub async fn get_or_fetch_global(app_name: &str, api_key: &str, api_base: &str) 
 
     // Fetch from LLM
     println!(
-        "[shortcuts] fetching shortcuts for '{}' via LLM...",
-        app_name
+        "[shortcuts] fetching shortcuts for '{}' via {} ...",
+        app_name, SHORTCUTS_MODEL
     );
     match fetch_via_llm(app_name, api_key, api_base).await {
         Ok(shortcuts) => {
@@ -175,4 +218,62 @@ pub async fn get_or_fetch_global(app_name: &str, api_key: &str, api_base: &str) 
             String::new()
         }
     }
+}
+
+// ── Tauri Commands ─────────────────────────────────────
+
+/// Return type for the list command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedShortcutEntry {
+    pub app_name: String,
+    pub shortcuts: String,
+}
+
+/// List all cached shortcuts (from memory cache).
+#[tauri::command]
+pub fn list_all_cached_shortcuts_cmd() -> Vec<CachedShortcutEntry> {
+    let lock = match global_cache().lock() {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    let mut entries: Vec<CachedShortcutEntry> = lock
+        .iter()
+        .filter(|(_, v)| !v.trim().is_empty())
+        .map(|(k, v)| CachedShortcutEntry {
+            app_name: k.clone(),
+            shortcuts: v.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.app_name.cmp(&b.app_name));
+    entries
+}
+
+/// Delete a single app's cached shortcuts (memory + disk).
+#[tauri::command]
+pub fn delete_cached_shortcuts_cmd(app_name: String) {
+    let key = app_name.trim().to_lowercase();
+    if let Ok(mut lock) = global_cache().lock() {
+        lock.remove(&key);
+    }
+    let path = shortcuts_disk_root().join(format!("{}.txt", key));
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    println!("[shortcuts] deleted cache for '{}'", key);
+}
+
+/// Export all cached shortcuts as a single markdown string.
+#[tauri::command]
+pub fn export_shortcuts_cmd() -> String {
+    let entries = list_all_cached_shortcuts_cmd();
+    if entries.is_empty() {
+        return "No shortcuts cached.".to_string();
+    }
+    let mut md = String::from("# Cached Keyboard Shortcuts\n\n");
+    for entry in &entries {
+        md.push_str(&format!("## {}\n\n", entry.app_name));
+        md.push_str(&entry.shortcuts);
+        md.push_str("\n\n---\n\n");
+    }
+    md
 }

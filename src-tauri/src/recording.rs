@@ -517,3 +517,166 @@ pub fn load_activity_log_cmd(session_id: String) -> Result<Vec<serde_json::Value
     let log: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     Ok(log)
 }
+
+// ═══════════════════════════════════════════════════════
+// ── Saved Runs (deterministic replay) ──────────────────
+// ═══════════════════════════════════════════════════════
+
+fn saved_runs_root() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("computer-use")
+        .join("saved-runs")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedRunStep {
+    pub action: String,
+    #[serde(default)]
+    pub x_norm: f64,
+    #[serde(default)]
+    pub y_norm: f64,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub sent_w: u32,
+    #[serde(default)]
+    pub sent_h: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shortcut: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedRun {
+    pub run_id: String,
+    pub name: String,
+    pub instruction: String,
+    #[serde(default)]
+    pub task_context: String,
+    #[serde(default)]
+    pub model: String,
+    pub created_at: u128,
+    pub steps: Vec<SavedRunStep>,
+    pub total_steps: usize,
+    #[serde(default)]
+    pub total_cost_usd: f64,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveRunRequest {
+    pub name: Option<String>,
+    pub instruction: String,
+    pub task_context: Option<String>,
+    pub model: Option<String>,
+    pub steps: Vec<SavedRunStep>,
+    pub total_cost_usd: Option<f64>,
+}
+
+#[tauri::command]
+pub fn save_run_cmd(req: SaveRunRequest) -> Result<SavedRun, String> {
+    let created = now_ms()?;
+    let run_id = format!("run-{}", created);
+    let name = req.name.unwrap_or_else(|| {
+        let preview: String = req.instruction.chars().take(60).collect();
+        if req.instruction.len() > 60 { format!("{}…", preview) } else { preview }
+    });
+
+    let run = SavedRun {
+        run_id: run_id.clone(),
+        name,
+        instruction: req.instruction,
+        task_context: req.task_context.unwrap_or_default(),
+        model: req.model.unwrap_or_default(),
+        created_at: created,
+        total_steps: req.steps.len(),
+        steps: req.steps,
+        total_cost_usd: req.total_cost_usd.unwrap_or(0.0),
+        notes: Vec::new(),
+    };
+
+    let dir = saved_runs_root().join(&run_id);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let json = serde_json::to_string_pretty(&run).map_err(|e| e.to_string())?;
+    fs::write(dir.join("run.json"), json).map_err(|e| e.to_string())?;
+
+    println!(
+        "[saved-runs] saved '{}': {} steps, cost=${:.6}",
+        run.run_id, run.total_steps, run.total_cost_usd
+    );
+
+    Ok(run)
+}
+
+#[tauri::command]
+pub fn list_saved_runs_cmd() -> Result<Vec<SavedRun>, String> {
+    let root = saved_runs_root();
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+
+    let mut runs = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let run_path = path.join("run.json");
+        if !run_path.exists() {
+            continue;
+        }
+        let text = fs::read_to_string(&run_path).map_err(|e| e.to_string())?;
+        if let Ok(run) = serde_json::from_str::<SavedRun>(&text) {
+            runs.push(run);
+        }
+    }
+
+    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(runs)
+}
+
+#[tauri::command]
+pub fn load_saved_run_cmd(run_id: String) -> Result<SavedRun, String> {
+    let run_path = saved_runs_root().join(&run_id).join("run.json");
+    if !run_path.exists() {
+        return Err(format!("Saved run '{}' not found", run_id));
+    }
+    let text = fs::read_to_string(&run_path).map_err(|e| e.to_string())?;
+    let run: SavedRun = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(run)
+}
+
+#[tauri::command]
+pub fn delete_saved_run_cmd(run_id: String) -> Result<(), String> {
+    let dir = saved_runs_root().join(&run_id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        println!("[saved-runs] deleted '{}'", run_id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn add_note_to_run_cmd(run_id: String, note: String) -> Result<SavedRun, String> {
+    let run_path = saved_runs_root().join(&run_id).join("run.json");
+    if !run_path.exists() {
+        return Err(format!("Saved run '{}' not found", run_id));
+    }
+    let text = fs::read_to_string(&run_path).map_err(|e| e.to_string())?;
+    let mut run: SavedRun = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    run.notes.push(note);
+    let json = serde_json::to_string_pretty(&run).map_err(|e| e.to_string())?;
+    fs::write(&run_path, json).map_err(|e| e.to_string())?;
+    println!("[saved-runs] added note to '{}' ({} notes)", run_id, run.notes.len());
+    Ok(run)
+}

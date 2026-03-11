@@ -1,10 +1,15 @@
 // ── OverlayWindow — Transparent Cursor Overlay ─────────
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AgentStep } from "../HudWidgets";
 import type { AgentCursorEvent } from "../types";
+
+// ── Easing: cubic ease-out for natural deceleration ──
+function easeOutCubic(t: number): number {
+  return 1 - Math.pow(1 - t, 3);
+}
 
 export function OverlayWindow() {
   const qs = new URLSearchParams(window.location.search);
@@ -15,13 +20,26 @@ export function OverlayWindow() {
     y: Number.isFinite(oy) ? oy : 0,
   });
 
-  const [cursor, setCursor] = useState<{
-    visible: boolean;
-    x: number;
-    y: number;
-    phase: string;
-  }>({ visible: false, x: 0, y: 0, phase: "move" });
+  // Rendered position (updated every animation frame)
+  const [renderPos, setRenderPos] = useState<{
+    x: number; y: number; phase: string; visible: boolean;
+  }>({ x: 0, y: 0, phase: "move", visible: false });
+
+  // Animation state refs (don't trigger re-renders)
+  const animRef = useRef({
+    fromX: 0, fromY: 0,
+    toX: 0, toY: 0,
+    startTime: 0, duration: 0,
+    rafId: null as number | null,
+    currentX: 0, currentY: 0,
+    everMoved: false,
+  });
+
   const [agentActive, setAgentActive] = useState(false);
+  const [hasAppeared, setHasAppeared] = useState(false);
+  const hideTimerRef = useRef<number | undefined>(undefined);
+  const rippleKeyRef = useRef(0);
+  const [rippleKey, setRippleKey] = useState(0);
 
   useLayoutEffect(() => {
     document.documentElement.classList.add("overlay-window");
@@ -32,8 +50,80 @@ export function OverlayWindow() {
     };
   }, []);
 
+  // ── Animate cursor from current position to target ──
+  const animateTo = useCallback((targetX: number, targetY: number, phase: string) => {
+    const anim = animRef.current;
+
+    // Cancel any running animation
+    if (anim.rafId !== null) {
+      cancelAnimationFrame(anim.rafId);
+      anim.rafId = null;
+    }
+
+    const dx = targetX - anim.currentX;
+    const dy = targetY - anim.currentY;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    // If first appearance or very small move, just jump
+    if (!anim.everMoved || distance < 5) {
+      anim.currentX = targetX;
+      anim.currentY = targetY;
+      anim.fromX = targetX;
+      anim.fromY = targetY;
+      anim.toX = targetX;
+      anim.toY = targetY;
+      anim.everMoved = true;
+      setRenderPos({ x: targetX, y: targetY, phase, visible: true });
+      if (!hasAppeared) setHasAppeared(true);
+      if (phase === "click") {
+        rippleKeyRef.current++;
+        setRippleKey(rippleKeyRef.current);
+      }
+      return;
+    }
+
+    // Duration scales with distance: 200ms min, 500ms max
+    const duration = Math.min(200 + distance * 0.4, 500);
+
+    anim.fromX = anim.currentX;
+    anim.fromY = anim.currentY;
+    anim.toX = targetX;
+    anim.toY = targetY;
+    anim.startTime = performance.now();
+    anim.duration = duration;
+
+    const step = (now: number) => {
+      const elapsed = now - anim.startTime;
+      const rawT = Math.min(elapsed / anim.duration, 1);
+      const t = easeOutCubic(rawT);
+
+      const x = anim.fromX + (anim.toX - anim.fromX) * t;
+      const y = anim.fromY + (anim.toY - anim.fromY) * t;
+
+      anim.currentX = x;
+      anim.currentY = y;
+
+      if (rawT < 1) {
+        // Mid-animation: show as "move"
+        setRenderPos({ x, y, phase: "move", visible: true });
+        anim.rafId = requestAnimationFrame(step);
+      } else {
+        // Arrived: show final phase (click/move)
+        setRenderPos({ x: anim.toX, y: anim.toY, phase, visible: true });
+        anim.rafId = null;
+        if (phase === "click") {
+          rippleKeyRef.current++;
+          setRippleKey(rippleKeyRef.current);
+        }
+      }
+    };
+
+    anim.rafId = requestAnimationFrame(step);
+    if (!hasAppeared) setHasAppeared(true);
+    setRenderPos((prev) => ({ ...prev, visible: true }));
+  }, [hasAppeared]);
+
   useEffect(() => {
-    let hideTimer: number | undefined;
     let unlistenCursor: (() => void) | undefined;
     let unlistenBounds: (() => void) | undefined;
 
@@ -59,21 +149,16 @@ export function OverlayWindow() {
 
           const localX = payload.x_pt - originRef.current.x;
           const localY = payload.y_pt - originRef.current.y;
-          setCursor({
-            visible: true,
-            x: localX,
-            y: localY,
-            phase: payload.phase,
-          });
 
-          if (hideTimer) {
-            window.clearTimeout(hideTimer);
+          // Animate to the new position
+          animateTo(localX, localY, payload.phase);
+
+          if (hideTimerRef.current) {
+            window.clearTimeout(hideTimerRef.current);
           }
-          hideTimer = window.setTimeout(() => {
-            setCursor((prev) => ({ ...prev, visible: false }));
-            void getCurrentWindow()
-              .hide()
-              .catch(() => undefined);
+          hideTimerRef.current = window.setTimeout(() => {
+            setRenderPos((prev) => ({ ...prev, visible: false }));
+            void getCurrentWindow().hide().catch(() => undefined);
           }, 3000);
         },
       );
@@ -87,11 +172,13 @@ export function OverlayWindow() {
     })();
 
     return () => {
-      if (hideTimer) window.clearTimeout(hideTimer);
+      if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
+      const anim = animRef.current;
+      if (anim.rafId !== null) cancelAnimationFrame(anim.rafId);
       if (unlistenCursor) unlistenCursor();
       if (unlistenBounds) unlistenBounds();
     };
-  }, []);
+  }, [animateTo]);
 
   // Listen for agent_step events to show/hide the glow border
   useEffect(() => {
@@ -103,7 +190,6 @@ export function OverlayWindow() {
         if (glowTimeout) window.clearTimeout(glowTimeout);
 
         if (payload.phase === "done" || payload.phase === "error") {
-          // Fade out after 2s
           glowTimeout = window.setTimeout(() => setAgentActive(false), 2000);
         } else {
           void (async () => {
@@ -124,17 +210,19 @@ export function OverlayWindow() {
     };
   }, []);
 
-  const cursorVisible = cursor.visible || agentActive;
-
   return (
     <main className="overlay-root">
       {agentActive && <div className="agent-glow-border" />}
-      {cursorVisible && (
+      {hasAppeared && (
         <div
-          className={`agent-cursor ${cursor.phase === "click" ? "click" : "move"}`}
-          style={{ left: `${cursor.x}px`, top: `${cursor.y}px` }}
+          className={`agent-cursor ${renderPos.phase === "click" ? "click" : "move"}`}
+          style={{
+            left: `${renderPos.x}px`,
+            top: `${renderPos.y}px`,
+            opacity: renderPos.visible ? 1 : 0,
+            transition: "opacity 400ms ease",
+          }}
         >
-          {/* Pointer arrow SVG */}
           <svg
             className="agent-cursor-pointer"
             viewBox="0 0 24 24"
@@ -150,9 +238,9 @@ export function OverlayWindow() {
             />
           </svg>
           <span className="agent-cursor-dot" />
-          <span className="agent-cursor-ripple" key={`r1-${cursor.x}-${cursor.y}-${cursor.phase}`} />
-          <span className="agent-cursor-ripple-2" key={`r2-${cursor.x}-${cursor.y}-${cursor.phase}`} />
-          {cursor.phase === "click" && (
+          <span className="agent-cursor-ripple" key={`r1-${rippleKey}`} />
+          <span className="agent-cursor-ripple-2" key={`r2-${rippleKey}`} />
+          {renderPos.phase === "click" && (
             <span className="agent-cursor-label">Click</span>
           )}
         </div>

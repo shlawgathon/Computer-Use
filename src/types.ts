@@ -1,6 +1,6 @@
 // ── Shared Type Definitions ────────────────────────────
 
-export type Tab = "run" | "sessions" | "dev";
+export type Tab = "run" | "activity" | "saved-runs" | "shortcuts" | "memory" | "dev";
 
 export type PermissionState = {
   screen_recording: boolean;
@@ -54,6 +54,8 @@ export type VisionAction = {
   sent_h: number;
   model: string;
   provider?: string | null;
+  tool_name?: string | null;
+  shortcut?: string | null;
   usage: {
     prompt_tokens?: number | null;
     completion_tokens?: number | null;
@@ -117,4 +119,32 @@ export type HudUpdate = {
 export type HudActionError = {
   action: string;
   message: string;
+};
+
+export type SavedRunStep = {
+  action: string;
+  x_norm: number;
+  y_norm: number;
+  confidence: number;
+  reason: string;
+  sent_w: number;
+  sent_h: number;
+  keys?: KeyAction[] | null;
+  text?: string | null;
+  command?: string | null;
+  tool_name?: string | null;
+  shortcut?: string | null;
+};
+
+export type SavedRun = {
+  run_id: string;
+  name: string;
+  instruction: string;
+  task_context: string;
+  model: string;
+  created_at: number;
+  steps: SavedRunStep[];
+  total_steps: number;
+  total_cost_usd: number;
+  notes: string[];
 };

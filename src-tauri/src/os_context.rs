@@ -351,11 +351,22 @@ pub(crate) fn gather_os_context_snapshot() -> OsContextSnapshot {
         }
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    parts.push(format!("System time (unix): {}", now));
+    let human_date = Command::new("date")
+        .arg("+%A, %B %d, %Y %I:%M %p")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("unix {}", now)
+        });
+    parts.push(format!("Current date/time: {}", human_date));
 
     let context_block = if parts.is_empty() {
         String::new()

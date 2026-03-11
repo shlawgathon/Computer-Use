@@ -2,6 +2,8 @@ import { describe, expect, it, mock } from "bun:test";
 import type { CaptureFrame, VisionAction } from "../src/types";
 import {
   executeAgentStepWithDeps,
+  formatHotkeyLabel,
+  formatToolCallLabel,
   formatVisionCost,
   formatVisionUsage,
   runAgentLoopWithDeps,
@@ -324,6 +326,40 @@ describe("agentRunner", () => {
         },
       }),
     ).toBe("~$0.001230");
+  });
+
+  it("formats tool-call and hotkey labels for HUD activity", () => {
+    const inferred: VisionAction = {
+      action: "hotkey",
+      x_norm: 0,
+      y_norm: 0,
+      confidence: 0.99,
+      reason: "Open a new tab",
+      model_ms: 10,
+      sent_w: 100,
+      sent_h: 100,
+      model: "test-model",
+      provider: "openrouter",
+      tool_name: "browser_new_tab",
+      shortcut: "Cmd+T",
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        total_tokens: 15,
+        estimated_prompt_tokens: 10,
+        estimated_completion_tokens: 5,
+        estimated_total_tokens: 15,
+        estimated_cost_usd: 0.0001,
+      },
+      keys: [
+        { key: "Meta", direction: "press" },
+        { key: "t", direction: "click" },
+        { key: "Meta", direction: "release" },
+      ],
+    };
+
+    expect(formatToolCallLabel(inferred)).toBe("browser_new_tab");
+    expect(formatHotkeyLabel(inferred)).toBe("Cmd+T");
   });
 
   it("emits an error step when inference stalls", async () => {

@@ -82,6 +82,10 @@ pub struct VisionAction {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shortcut: Option<String>,
     pub usage: InferenceUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<KeyAction>>,

@@ -38,31 +38,29 @@ interface RunTabProps {
 
 export function RunTab(props: RunTabProps) {
   return (
-    <>
-      <article className="card">
-        <div className="card-head">
-          <h2>Run</h2>
-          <div className="row">
-            <button onClick={props.refreshPermissions}>Check Permissions</button>
-            <button onClick={props.requestPermissions}>Request</button>
-            <button onClick={props.validateApiKey}>Validate API Key</button>
-            <button onClick={props.refreshRuntime}>Refresh Runtime</button>
-          </div>
+    <section className="card">
+      <div className="card-head">
+        <h2>Run</h2>
+        <div className="row">
+          <button onClick={props.refreshPermissions}>Check Permissions</button>
+          <button onClick={props.requestPermissions}>Request</button>
+          <button onClick={props.validateApiKey}>Validate API Key</button>
+          <button onClick={props.refreshRuntime}>Refresh Runtime</button>
         </div>
-        <HealthGrid
-          permsReady={props.permsReady}
-          keyReady={props.keyReady}
-          keyLabel={props.keyLabel}
-          estopOn={props.estopOn}
-          overlayEnabled={props.overlayEnabled}
-          hudEnabled={props.hudEnabled}
-          modelActivity={props.modelActivity}
-          runtime={props.runtime}
-        />
-      </article>
+      </div>
 
-      <article className="card">
-        <h3>Live Command</h3>
+      <HealthGrid
+        permsReady={props.permsReady}
+        keyReady={props.keyReady}
+        keyLabel={props.keyLabel}
+        estopOn={props.estopOn}
+        overlayEnabled={props.overlayEnabled}
+        hudEnabled={props.hudEnabled}
+        modelActivity={props.modelActivity}
+        runtime={props.runtime}
+      />
+
+      <div style={{ borderTop: "1px solid var(--card-border)", paddingTop: 12 }}>
         <label>
           Instruction
           <input
@@ -70,15 +68,15 @@ export function RunTab(props: RunTabProps) {
             onChange={(e) => props.setInstruction(e.target.value)}
           />
         </label>
-        <label>
-          Task Context (sent with instruction)
+        <label style={{ marginTop: 8 }}>
+          Task Context
           <textarea
             rows={3}
             value={props.taskContext}
             onChange={(e) => props.setTaskContext(e.target.value)}
           />
         </label>
-        <label>
+        <label style={{ marginTop: 8 }}>
           Model
           <select
             value={props.model}
@@ -89,33 +87,33 @@ export function RunTab(props: RunTabProps) {
             ))}
           </select>
         </label>
-        <div className="row">
-          <button
-            className="primary"
-            onClick={props.runLiveOnce}
-            disabled={props.busy.capture || props.busy.infer || props.busy.click}
-          >
-            Run One-Shot
-          </button>
-          <button
-            className="primary"
-            onClick={props.runAgentLoop}
-            disabled={props.looping || props.busy.capture || props.busy.infer || props.busy.click}
-          >
-            {props.looping ? "Looping..." : "Run Agent Loop"}
-          </button>
-          {props.looping && (
-            <button onClick={props.stopLoop}>
-              Stop Loop
-            </button>
-          )}
-          <button onClick={() => props.setEstop(false)}>Clear E-STOP</button>
-          <button onClick={() => props.setEstop(true)}>Force E-STOP</button>
-        </div>
-        <p className="muted">
-          Global kill switch: <code>Cmd+Shift+Esc</code>
-        </p>
-      </article>
-    </>
+      </div>
+
+      <div className="row">
+        <button
+          className="primary"
+          onClick={props.runLiveOnce}
+          disabled={props.busy.capture || props.busy.infer || props.busy.click}
+        >
+          Run One-Shot
+        </button>
+        <button
+          className="primary"
+          onClick={props.runAgentLoop}
+          disabled={props.looping || props.busy.capture || props.busy.infer || props.busy.click}
+        >
+          {props.looping ? "Looping..." : "Run Agent Loop"}
+        </button>
+        {props.looping && (
+          <button onClick={props.stopLoop}>Stop Loop</button>
+        )}
+        <button onClick={() => props.setEstop(false)}>Clear E-STOP</button>
+        <button onClick={() => props.setEstop(true)}>Force E-STOP</button>
+      </div>
+
+      <p className="muted" style={{ fontSize: "0.75rem" }}>
+        Kill switch: <code>Cmd+Shift+Esc</code>
+      </p>
+    </section>
   );
 }
