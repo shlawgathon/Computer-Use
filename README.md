@@ -179,17 +179,20 @@ A compact, transparent pill that floats above everything — your command center
 | Control    | What it does                                    |
 | ---------- | ----------------------------------------------- |
 | ☰ Menu    | Toggle the main dashboard window                |
-| ◉ Record   | Open the session recording panel                |
+| ▶ Run      | Start the agent loop                            |
 | ✏️ Command | Type an instruction and run the agent loop      |
 | ▼ Activity | Live timestamped feed of every agent step       |
-| 🎯 Overlay | Toggle the visual cursor overlay (red when off) |
 | ◄ Collapse | Shrink HUD to a single circle, click to expand  |
+| ⋮ Grip    | Drag the HUD to reposition it on screen         |
 
+- **Apple glass aesthetic** — frosted translucent background with `backdrop-filter: blur(40px)`, subtle inset highlights, and smooth 250ms transition to opaque when macOS drops blur on unfocused windows.
+- **Run mode UX** — when the agent starts running, the input box is replaced by a task summary pill showing the current instruction. The stop button becomes a pause/resume toggle. A redirect chat input appears inside the activity panel to change the agent's goal mid-run while preserving previous context.
 - **Elapsed timer** shows a running clock (▶ 0:05) during agent runs and (● 0:12) during recording.
 - **Activity feed** shows HH:MM:SS timestamps on every step — **auto-opens when the agent starts a task**.
 - **Blue glow border** pulses around the entire screen while the agent is actively running.
 - **Model selector** — pick a model directly in the HUD's command or record panels.
-- Collapsible to a 48px circle centered on screen.
+- **Save Run** — after a run completes, a save button appears in both the HUD and activity panel to persist the run for deterministic replay.
+- Collapsible to a draggable 28px circle centered on screen.
 
 ### Session Recording & Replay
 
@@ -223,15 +226,25 @@ The backend now uses a single session recording implementation in `recording.rs`
 
 - Full-screen transparent window spanning all monitors.
 - Visual cursor shows exactly where the agent clicked — with pulse animations.
-- **Blue glow border** — pulsing blue border around the entire screen while the agent is in control.
+- **Animated glow border** — rotating conic-gradient beam that continuously travels around the screen edge (3s rotation) combined with pulsing blue box-shadows (2s breathe cycle). Uses CSS `@property` for smooth custom property animation.
 - The overlay is `pointer-events: none` — the agent's CGEvent clicks pass right through it.
 
 ### Safety Controls
 
 - **Global E-STOP**: `Cmd+Shift+Esc` — immediately halts all agent actions.
 - **Restore window**: `Cmd+Shift+Enter` — brings the dashboard back if minimized.
-- **Max action cap** (30 per run) with auto-stop.
+- **Max action cap** (configurable: 30, 50, 100, or ∞) with auto-stop. Adjustable in the Settings tab.
 - Per-action confidence threshold gating.
+
+### Settings Tab (formerly Dev Tools)
+
+The Settings tab provides operational controls in four panels:
+
+- **System Status** — at-a-glance view of screen recording permission, accessibility permission, API key status, and E-STOP state with refresh/request buttons.
+- **API Configuration** — validate API key and open the config folder directly in Finder.
+- **Safety Controls** — E-STOP toggle, action counter, and max steps hard cap selector (30/50/100/∞ presets or custom number input).
+- **Data & Storage** — open recordings and saved runs folders in Finder, showing the full paths.
+- **Cursor Preview & Test** — interactive test area to preview and customize the agent cursor (size slider, color presets).
 
 ### Shell Commands + WhiteCircle Guardrails
 
@@ -250,9 +263,9 @@ The backend now uses a single session recording implementation in `recording.rs`
 ```mermaid
 flowchart LR
     subgraph FE["Frontend Windows"]
-        MAIN["Main dashboard<br/>Run / Sessions / Dev Tools"]
-        HUD["Floating HUD<br/>command, record, replay"]
-        OVERLAY["Transparent overlay<br/>cursor pulse + blue border"]
+        MAIN["Main dashboard<br/>Run / Activity / Saved Runs / Shortcuts / Memory / Settings"]
+        HUD["Floating HUD<br/>glass pill, run mode, redirect chat"]
+        OVERLAY["Transparent overlay<br/>animated cursor + rotating glow border"]
         RUNNER["agentRunner.ts<br/>shared capture → infer → execute loop"]
         MAIN --> RUNNER
         HUD --> RUNNER
